@@ -1,5 +1,4 @@
-# Parameterization method of reservoir properties for ensemble-based data assimilation 
-#                 using intermediate latent space of StyleGAN 
+# Parameterization method of reservoir properties for ensemble-based data assimilation using intermediate latent space of StyleGAN 
 
 This research is the improvement the generation of image facies with geologic realism in the same time with better data assimilation, trough the StyleGAN model using intermediate latent space (w-space). The results demonstrated that all three models are highly efficient, with the StyleGAN2 model standing out for generating samples with geological realism and achieving excellent data matching in the cases studied.
 
