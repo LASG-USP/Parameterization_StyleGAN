@@ -7,9 +7,13 @@ Parameterization_StyleGAN is a python3 project providing tools for the parameter
 
 Version 1.0 - September 2026
 
+For case study 1: Categorical training dataset
+
 <img src="https://github.com/LASG-USP/Parameterization_StyleGAN/blob/main/Fig.1.png" width="1200">
 
 <img src="https://github.com/LASG-USP/Parameterization_StyleGAN/blob/main/Fig.2.png" width="1200">
+
+For case study 2: Continuous training dataset
 
 <img src="https://github.com/LASG-USP/Parameterization_StyleGAN/blob/main/Fig.3.png" width="1200">
 
