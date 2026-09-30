@@ -1,19 +1,21 @@
 # Parameterization method of reservoir properties for ensemble-based data assimilation using intermediate latent space of StyleGAN 
 
-This research is the improvement the generation of image facies with geologic realism in the same time with better data assimilation, trough the StyleGAN model using intermediate latent space (w-space). The results demonstrated that all three models are highly efficient, with the StyleGAN2 model standing out for generating samples with geological realism and achieving excellent data matching in the cases studied.
+This research is the improvement the generation of image facies with geologic realism in the same time with better data assimilation, trough the StyleGAN model using intermediate latent space (w-space). To demonstrate the effectiveness of this method, we compared our approach with data assimilation using the conventional latent z-space, as well as against state-of-the art models in these problems, such as Latent Diffusion models (Federico and Durlofsky, 2025) and VAE-GAN (Sampaio et al., 2026). The results demonstrated that all three models are highly efficient, with the StyleGAN2 model standing out for generating samples with geological realism and achieving excellent data matching in the cases studied.
 
 Parameterization_StyleGAN is a python3 project providing tools for the parameterization of reservoir properties for data assimilation using ESMDA.
 
 
 Version 1.0 - September 2026
 
-For case study 1: Categorical training dataset
+Main results:
+
+For case study 1: categorical training dataset
 
 <img src="https://github.com/LASG-USP/Parameterization_StyleGAN/blob/main/Fig.1.png" width="1200">
 
 <img src="https://github.com/LASG-USP/Parameterization_StyleGAN/blob/main/Fig.2.png" width="1200">
 
-For case study 2: Continuous training dataset
+For case study 2: continuous training dataset
 
 <img src="https://github.com/LASG-USP/Parameterization_StyleGAN/blob/main/Fig.3.png" width="1200">
 
@@ -26,7 +28,7 @@ If you want to access the source code and potentially contribute. You should fol
 
 ### 1. Download
 
-Download SG from the [Github repository](https://github.com/LASG-USP/Parameterization_StyleGAN): green button "clone or download". Then, unzip it on your computer. 
+Download SG folder from the [Github repository](https://github.com/LASG-USP/Parameterization_StyleGAN): green button "clone or download". Then, unzip it on your computer. 
 
 
 ### 2. Go in the directory
@@ -36,7 +38,8 @@ Once this has been done, open a Python prompt (like the Anaconda prompt), and go
 
 ### 3. Launch the local installation
 
-After downloading and opening the folder on your computer, you will have three folders: GAN, VAE, VAE-GAN.
+After downloading and opening the folder on your computer, you will have files: VAE-GAN, LD (Latent Diffusion) and SG (StyleGAN).
+
 
 1 - For the VAE-GAN model, within the SG folder, simply run the following for each of the created cases:
 
@@ -90,7 +93,13 @@ To measure the quality of the generated images: Fréchet Inception Distance (FID
 To verify the quality and geological realism of the generated samples: variogram (MSE), connectivity (MSE), histogram KL, PCA correlation, and MDS MMD (Maximum Mean Discrepancy).
 
 
-## Reference
+## References
+
+Federico, G.; Durlofsky, L. J. Latent diffusion models for parameterization of facies-based geomodels and their use in data assimilation, Computers & Geosciences, Volume 194, 2025, 105755, ISSN 0098-3004, https://doi.org/10.1016/j.cageo.2024.105755.
+
+Sampaio, M. A.; Ranazzi, P. H.; Blunt, M. J.; Enhancing the parameterization of reservoir properties for data assimilation using deep VAE-GAN, Computers & Geosciences, Volume 214, 2026, 106196, ISSN 0098-3004, https://doi.org/10.1016/j.cageo.2026.106196.
+
+
 
 The SG package implements three deep learning models (VAE-GAN, LDM and StyleGAN2) for parameterization and data assimilation that were
 investigated and discussed in:
