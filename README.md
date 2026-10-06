@@ -104,4 +104,4 @@ Sampaio, M. A.; Ranazzi, P. H.; Blunt, M. J.; Enhancing the parameterization of 
 The SG package implements three deep learning models (VAE-GAN, LDM and StyleGAN2) for parameterization and data assimilation that were
 investigated and discussed in:
 
-SAMPAIO, M. A.; RANAZZI, P. H.; BLUNT, M. J., Parameterization method of reservoir properties for ensemble-based data assimilation using intermediate latent space of StyleGAN, submitted to Geoenergy Science and Engineering.
+SAMPAIO, M. A.; RANAZZI, P. H.; BLUNT, M. J., Parameterization method of reservoir properties for ensemble-based data assimilation using intermediate latent space of StyleGAN, submitted to Engineering Applications of Artificial Intelligence.
