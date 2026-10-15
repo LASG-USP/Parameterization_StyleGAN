@@ -59,18 +59,18 @@ if gpus:
 
 # Configuration
 zdim = 512
-epochs = 150  # 150
+epochs = 150
 batch_size = 32
 initial_lr = 0.0001
-beta = 0.2  # KL loss weight (used as reconstruction loss weight in diffusion)
-gamma = 0.1  # Not used in diffusion but kept for compatibility
-alpha = 0.2  # LeakyReLU alpha
+beta = 0.2
+gamma = 0.1
+alpha = 0.2
 d_reg = 5
 metric_interval = 10
 name = 'unisim_ii_cropped'
 
 # Latent Diffusion specific parameters
-num_timesteps = 1000  # Number of diffusion steps
+num_timesteps = 1000
 beta_start = 0.0001
 beta_end = 0.02
 
@@ -447,42 +447,115 @@ def build_decoder(latent_dim, output_shape):
 decoder = build_decoder(latent_dim, (ni, nj, nz))
 
 
-def build_unet_model(latent_dim, time_emb_dim=256):
+# ==============================================
+# REAL 1D UNET DENOISER
+# ==============================================
+
+def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
+    """
+    Real 1D UNet for latent diffusion denoising.
+
+    Levels (for latent_dim=512, base_filters=64):
+        e0: 512 x 64
+        e1: 256 x 128
+        e2: 128 x 256
+        e3:  64 x 512   <- bottleneck input
+        bottleneck: 64 x 512 (x2 residual blocks)
+        U3: 128 x 256   (skip from e2)
+        U2: 256 x 128   (skip from e1)
+        U1: 512 x 64    (skip from e0)
+        out: 512 x 1
+    """
+    assert latent_dim % 8 == 0, \
+        f"latent_dim must be divisible by 8 for 3 pooling levels (got {latent_dim})"
+
     def sinusoidal_embedding(x):
         half_dim = time_emb_dim // 2
         emb = tf.math.log(10000.0) / (half_dim - 1)
         emb = tf.exp(tf.range(half_dim, dtype=tf.float32) * -emb)
-        x_expanded = tf.cast(x, tf.float32)
-        emb = x_expanded * emb
-        sin_emb = tf.sin(emb)
-        cos_emb = tf.cos(emb)
-        full_emb = tf.concat([sin_emb, cos_emb], axis=1)
-        if time_emb_dim % 2 == 1:
-            full_emb = tf.pad(full_emb, [[0, 0], [0, 1]])
-        return full_emb
+        x = tf.cast(x, tf.float32)
+        emb = x * emb
+        return tf.concat([tf.sin(emb), tf.cos(emb)], axis=1)
 
-    latent_input = keras.Input(shape=(latent_dim,), dtype=tf.float32)
-    time_input = keras.Input(shape=(1,), dtype=tf.float32)
-    time_emb = sinusoidal_embedding(time_input)
-    time_emb = layers.Dense(time_emb_dim, dtype=tf.float32)(time_emb)
-    time_emb = layers.Activation("swish")(time_emb)
-    time_emb = layers.Dense(time_emb_dim, dtype=tf.float32)(time_emb)
-    x = layers.Dense(time_emb_dim, dtype=tf.float32)(latent_input)
-    x = layers.Add()([x, time_emb])
-    x = layers.Dense(1024, dtype=tf.float32)(x)
-    x = layers.LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.1)(x)
-    x = layers.Dense(1024, dtype=tf.float32)(x)
-    x = layers.LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.1)(x)
-    x = layers.Dense(512, dtype=tf.float32)(x)
-    x = layers.LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.1)(x)
-    output = layers.Dense(latent_dim, dtype=tf.float32)(x)
-    return keras.Model([latent_input, time_input], output, name="unet")
+    def time_mlp(t_emb):
+        x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_1")(t_emb)
+        x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_2")(x)
+        return x
+
+    def res_block(x, t_emb, filters, name):
+        h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv1")(x)
+        h = layers.LayerNormalization(name=f"{name}_ln1")(h)
+        h = layers.Activation("swish", name=f"{name}_act1")(h)
+
+        t = layers.Dense(filters, name=f"{name}_tproj")(t_emb)
+        t = layers.Reshape((1, filters), name=f"{name}_treshape")(t)
+        h = layers.Add(name=f"{name}_tadd")([h, t])
+
+        h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv2")(h)
+        h = layers.LayerNormalization(name=f"{name}_ln2")(h)
+
+        if x.shape[-1] != filters:
+            x = layers.Conv1D(filters, 1, padding="same", name=f"{name}_skip_proj")(x)
+
+        out = layers.Add(name=f"{name}_resadd")([x, h])
+        return layers.Activation("swish", name=f"{name}_out")(out)
+
+    def downsample(x, filters, name):
+        return layers.Conv1D(filters, 4, strides=2, padding="same", name=f"{name}_down")(x)
+
+    def upsample_with_skip(x, skip, filters, name):
+        x = layers.UpSampling1D(size=2, name=f"{name}_up")(x)
+        assert x.shape[1] == skip.shape[1], (
+            f"[{name}] upsampled length {x.shape[1]} != skip length {skip.shape[1]}. "
+            f"Confira qual nível está sendo passado como skip."
+        )
+        x = layers.Concatenate(name=f"{name}_concat")([x, skip])
+        x = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv")(x)
+        x = layers.LayerNormalization(name=f"{name}_ln")(x)
+        return layers.Activation("swish", name=f"{name}_act")(x)
+
+    latent_input = keras.Input(shape=(latent_dim,), dtype=tf.float32, name="latent_input")
+    time_input = keras.Input(shape=(1,), dtype=tf.float32, name="time_input")
+
+    t_emb = sinusoidal_embedding(time_input)
+    t_emb = time_mlp(t_emb)
+
+    x = layers.Reshape((latent_dim, 1), name="reshape_input")(latent_input)
+    x = layers.Conv1D(base_filters, 3, padding="same", name="input_conv")(x)
+
+    # ENCODER
+    e0 = res_block(x, t_emb, base_filters, "enc0")
+    d1 = downsample(e0, base_filters * 2, "enc1_down")
+    e1 = res_block(d1, t_emb, base_filters * 2, "enc1")
+    d2 = downsample(e1, base_filters * 4, "enc2_down")
+    e2 = res_block(d2, t_emb, base_filters * 4, "enc2")
+    d3 = downsample(e2, base_filters * 8, "enc3_down")
+    e3 = res_block(d3, t_emb, base_filters * 8, "enc3")
+
+    # BOTTLENECK
+    b = res_block(e3, t_emb, base_filters * 8, "bottleneck_1")
+    b = res_block(b, t_emb, base_filters * 8, "bottleneck_2")
+
+    # DECODER (with correct skips)
+    u3 = upsample_with_skip(b, e2, base_filters * 4, "dec3")
+    u3 = res_block(u3, t_emb, base_filters * 4, "dec3_res")
+
+    u2 = upsample_with_skip(u3, e1, base_filters * 2, "dec2")
+    u2 = res_block(u2, t_emb, base_filters * 2, "dec2_res")
+
+    u1 = upsample_with_skip(u2, e0, base_filters, "dec1")
+    u1 = res_block(u1, t_emb, base_filters, "dec1_res")
+
+    # OUTPUT
+    out = layers.Conv1D(base_filters, 3, padding="same", name="out_conv1")(u1)
+    out = layers.Activation("swish", name="out_act")(out)
+    out = layers.Conv1D(1, 3, padding="same", name="out_conv2")(out)
+    out = layers.Reshape((latent_dim,), name="output_reshape")(out)
+
+    return keras.Model([latent_input, time_input], out, name="unet_1d")
 
 
-unet = build_unet_model(latent_dim)
+unet = build_unet_model(latent_dim, time_emb_dim=256, base_filters=64)
 
 
 class DiffusionModel(keras.Model):
@@ -586,9 +659,6 @@ class DiffusionModel(keras.Model):
             noisy_latents = self.q_sample(latents, t, noise)
             t_reshaped = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
             pred_noise = self.unet([noisy_latents, t_reshaped], training=True)
-            if pred_noise.shape != noise.shape:
-                if len(pred_noise.shape) == 3 and len(noise.shape) == 2:
-                    pred_noise = tf.squeeze(pred_noise, axis=1)
             diffusion_loss = tf.reduce_mean(tf.square(pred_noise - noise))
             reconstructed = self.decoder(latents, training=True)
             reconstructed = tf.cast(reconstructed, tf.float32)
@@ -619,9 +689,6 @@ class DiffusionModel(keras.Model):
         noisy_latents = self.q_sample(latents, t, noise)
         t_reshaped = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
         pred_noise = self.unet([noisy_latents, t_reshaped], training=False)
-        if pred_noise.shape != noise.shape:
-            if len(pred_noise.shape) == 3 and len(noise.shape) == 2:
-                pred_noise = tf.squeeze(pred_noise, axis=1)
         diffusion_loss = tf.reduce_mean(tf.square(pred_noise - noise))
         reconstructed = self.decoder(latents, training=False)
         reconstructed = tf.cast(reconstructed, tf.float32)
@@ -662,6 +729,12 @@ diffusion_model = DiffusionModel(
 dummy_input = tf.random.normal((1, ni, nj, nz), dtype=tf.float32)
 _ = diffusion_model(dummy_input)
 diffusion_model.compile()
+
+print("\n" + "=" * 60)
+print("UNET ARCHITECTURE SUMMARY")
+print("=" * 60)
+unet.summary()
+print("=" * 60 + "\n")
 
 
 def lr_scheduler(epoch):
@@ -1427,9 +1500,6 @@ def create_file_summary(prefix="latent_diffusion"):
 # FINAL TRAINING REPORT FUNCTION
 # ==============================================
 def generate_final_report(filepath, params, execution_time, loss_history, metrics_history, static_metrics_results):
-    """
-    Generates a complete final training report and saves it to a .txt file
-    """
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write("=" * 80 + "\n")
         f.write("               FINAL LATENT DIFFUSION TRAINING REPORT\n")
@@ -1524,12 +1594,15 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write("    Output Act         : tanh\n")
         f.write("    Dropout            : 0.2\n\n")
 
-        f.write("  UNet (Diffusion):\n")
+        f.write("  UNet Denoiser (1D, real UNet):\n")
         f.write(f"    Input Dim          : {latent_dim}\n")
         f.write(f"    Time Emb Dim       : 256\n")
-        f.write("    Hidden Layers      : 1024, 1024, 512\n")
-        f.write("    Activation         : LeakyReLU (0.2), swish\n")
-        f.write("    Dropout            : 0.1\n\n")
+        f.write("    Structure          : 3-level encoder / bottleneck / 3-level decoder\n")
+        f.write("    Skip Connections   : Yes (e2 -> U3, e1 -> U2, e0 -> U1)\n")
+        f.write("    Encoder Channels   : 64 / 128 / 256 / 512\n")
+        f.write("    Bottleneck Ch.     : 512 (x2 residual blocks)\n")
+        f.write("    Residual Blocks    : LayerNorm + Conv1D + time-conditioning\n")
+        f.write("    Activation         : swish\n\n")
 
         f.write("  Diffusion:\n")
         f.write(f"    Timesteps          : {num_timesteps}\n")
@@ -1805,7 +1878,10 @@ training_params = {
     'Beta end': beta_end,
     'Training samples': len(x_train),
     'Test samples': len(x_test),
-    'Model': 'Latent Diffusion Model',
+    'Model': 'Latent Diffusion Model with real 1D UNet denoiser',
+    'UNet structure': 'Encoder(3) + Bottleneck(2x) + Decoder(3) with skip connections',
+    'UNet base filters': 64,
+    'UNet time emb dim': 256,
     'Optimizer': 'Adam (beta1=0.5, clipnorm=1.0)',
     'Early Stopping': 'Yes (patience=20, monitor=val_loss)',
     'LR Scheduler': 'ReduceLROnPlateau (factor=0.5, patience=5)',
