@@ -1,3 +1,7 @@
+import os
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
@@ -5,14 +9,13 @@ from tensorflow.keras import layers
 import matplotlib.pyplot as plt
 from tensorflow.keras.layers import LeakyReLU, BatchNormalization
 from tensorflow.keras.models import load_model
-from keras import Model
-from keras.applications.inception_v3 import InceptionV3
+from tensorflow.keras import Model
+from tensorflow.keras.applications.inception_v3 import InceptionV3
 from scipy.stats import gaussian_kde
 from scipy.spatial.distance import pdist, squareform
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS
 import time
-import os
 import seaborn as sns
 import pandas as pd
 import pickle
@@ -43,7 +46,6 @@ plt.rcParams.update({
     'font.family': 'sans-serif',
 })
 
-# Fully clear TensorFlow session
 tf.keras.backend.clear_session()
 gc.collect()
 
@@ -69,14 +71,15 @@ d_reg = 5
 metric_interval = 10
 name = 'unisim_ii_cropped'
 
-# Latent Diffusion specific parameters
 num_timesteps = 1000
 beta_start = 0.0001
 beta_end = 0.02
 
-# >>> Reduzido de 1000 para 500: FID só usa [:500] e static metrics só usa min(500,...)
-# Isso corta ~50% do tempo do callback de métricas sem alterar NENHUM resultado.
+# FID/FRD só usam [:500], então gerar 500 amostras é suficiente.
 FID_SAMPLE_SIZE = 500
+
+# Chunk size para o sampling — reduz pico de memória do UNet em ~8x.
+SAMPLE_CHUNK_SIZE = 64
 
 HIGH_RES_CONFIG = {
     'dpi': 300,
@@ -125,12 +128,12 @@ print(f"Test samples: {len(x_test)}")
 print(f"Latent dimension: {latent_dim}")
 print(f"Diffusion steps: {num_timesteps}")
 print(f"FID/FRD sample size: {FID_SAMPLE_SIZE}")
+print(f"Sample chunk size: {SAMPLE_CHUNK_SIZE}")
+print(f"GPU allocator: {os.environ.get('TF_GPU_ALLOCATOR', 'default')}")
 print(f"{'=' * 60}\n")
 
 
 class MemoryOptimizer:
-    """Class for memory optimization during training."""
-
     @staticmethod
     def memory_usage():
         process = psutil.Process()
@@ -158,8 +161,6 @@ class MemoryOptimizer:
 
 
 class StaticMetrics:
-    """Class for calculating static geostatistical metrics."""
-
     @staticmethod
     def variogram_2d(data, lag_distances=None, max_lag=None):
         if len(data.shape) == 4:
@@ -467,20 +468,6 @@ decoder = build_decoder(latent_dim, (ni, nj, nz))
 # ==============================================
 
 def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
-    """
-    Real 1D UNet for latent diffusion denoising.
-
-    Levels (for latent_dim=512, base_filters=64):
-        e0: 512 x 64
-        e1: 256 x 128
-        e2: 128 x 256
-        e3:  64 x 512   <- bottleneck input
-        bottleneck: 64 x 512 (x2 residual blocks)
-        U3: 128 x 256   (skip from e2)
-        U2: 256 x 128   (skip from e1)
-        U1: 512 x 64    (skip from e0)
-        out: 512 x 1
-    """
     assert latent_dim % 8 == 0, \
         f"latent_dim must be divisible by 8 for 3 pooling levels (got {latent_dim})"
 
@@ -521,8 +508,7 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
     def upsample_with_skip(x, skip, filters, name):
         x = layers.UpSampling1D(size=2, name=f"{name}_up")(x)
         assert x.shape[1] == skip.shape[1], (
-            f"[{name}] upsampled length {x.shape[1]} != skip length {skip.shape[1]}. "
-            f"Confira qual nível está sendo passado como skip."
+            f"[{name}] upsampled length {x.shape[1]} != skip length {skip.shape[1]}."
         )
         x = layers.Concatenate(name=f"{name}_concat")([x, skip])
         x = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv")(x)
@@ -551,7 +537,7 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
     b = res_block(e3, t_emb, base_filters * 8, "bottleneck_1")
     b = res_block(b, t_emb, base_filters * 8, "bottleneck_2")
 
-    # DECODER with correct skips
+    # DECODER with correct skips (e2 -> U3, e1 -> U2, e0 -> U1)
     u3 = upsample_with_skip(b, e2, base_filters * 4, "dec3")
     u3 = res_block(u3, t_emb, base_filters * 4, "dec3_res")
 
@@ -574,7 +560,7 @@ unet = build_unet_model(latent_dim, time_emb_dim=256, base_filters=64)
 
 
 class DiffusionModel(keras.Model):
-    """Latent Diffusion Model for generation."""
+    """Latent Diffusion Model for continuous generation."""
 
     def __init__(self, encoder, decoder, unet, num_timesteps=1000,
                  beta_start=0.0001, beta_end=0.02, **kwargs):
@@ -643,21 +629,39 @@ class DiffusionModel(keras.Model):
             noise = tf.random.normal(shape=tf.shape(x), dtype=tf.float32)
             return model_mean + tf.sqrt(posterior_variance_t) * noise
 
-    def sample(self, num_samples, training=False, verbose=True):
+    def sample(self, num_samples, training=False, verbose=True, chunk_size=SAMPLE_CHUNK_SIZE):
+        """
+        Geração em chunks para evitar picos de memória no GPU.
+        Cada chunk roda o loop de difusão completo e é concatenado no final.
+        Nenhum resultado muda — apenas o pico de VRAM cai ~ (batch/chunk_size) vezes.
+        """
         if verbose:
-            print(f"\nGenerating {num_samples} samples...")
-        x = tf.random.normal((num_samples, latent_dim), dtype=tf.float32)
-        for i in range(self.num_timesteps - 1, -1, -1):
-            t = tf.ones((num_samples,), dtype=tf.int32) * i
-            x = self.p_sample(x, t, i)
-            if verbose and (i % 100 == 0 or i < 10):
-                print(f"  Timestep {i + 1}/{self.num_timesteps}")
-        if verbose:
-            print("Decoding latents to images...")
-        generated_images = self.decoder(x, training=training)
-        if isinstance(generated_images, tf.Tensor):
-            generated_images = generated_images.numpy()
-        generated_images = np.clip(generated_images, -1.0, 1.0)
+            print(f"\nGenerating {num_samples} samples (chunk_size={chunk_size})...")
+
+        all_generated = []
+        n_chunks = (num_samples + chunk_size - 1) // chunk_size
+
+        for c in range(n_chunks):
+            cur = min(chunk_size, num_samples - c * chunk_size)
+            x = tf.random.normal((cur, latent_dim), dtype=tf.float32)
+            for i in range(self.num_timesteps - 1, -1, -1):
+                t = tf.ones((cur,), dtype=tf.int32) * i
+                x = self.p_sample(x, t, i)
+                if verbose and (i % 200 == 0 or i < 5):
+                    print(f"  [chunk {c+1}/{n_chunks}] Timestep {i + 1}/{self.num_timesteps}")
+
+            generated = self.decoder(x, training=training)
+            if isinstance(generated, tf.Tensor):
+                generated = generated.numpy()
+            generated = np.clip(generated, -1.0, 1.0)
+            all_generated.append(generated)
+
+            # libera tensores intermediários do chunk atual
+            del x, generated
+            gc.collect()
+
+        generated_images = np.concatenate(all_generated, axis=0)
+
         if verbose:
             img_mean = np.mean(np.abs(generated_images))
             print(f"Sample generation complete. Mean absolute value: {img_mean:.4f}")
@@ -918,6 +922,10 @@ class DistributionPlotCallback(tf.keras.callbacks.Callback):
             else:
                 print(f"Displayed distribution plots at epoch {epoch + 1} (not saved)")
 
+            # libera memória após o callback
+            del latents, reconstructions, latent_samples
+            gc.collect()
+
 
 class LivePlotCallback(keras.callbacks.Callback):
     def __init__(self, model, data, num_images=5, save_interval=10):
@@ -940,8 +948,8 @@ class LivePlotCallback(keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
         indices = np.random.randint(0, self.data.shape[0], self.num_images)
         original_imgs = self.data[indices]
-        latents = self.model.encoder.predict(original_imgs)
-        reconstructed_imgs = self.model.decoder.predict(latents)
+        latents = self.model.encoder.predict(original_imgs, verbose=0)
+        reconstructed_imgs = self.model.decoder.predict(latents, verbose=0)
         for i in range(self.num_images):
             self.ax[i * 2].imshow(original_imgs[i].squeeze(), cmap='viridis', interpolation='nearest')
             self.ax[i * 2].set_title("Original", fontweight='bold', fontsize=8)
@@ -957,6 +965,11 @@ class LivePlotCallback(keras.callbacks.Callback):
             print(f"Saved epoch {epoch + 1} plot: {len(saved_files)} files")
         else:
             print(f"Displayed epoch {epoch + 1} plot (not saved)")
+
+        # libera memória após o callback
+        del latents, reconstructed_imgs
+        gc.collect()
+
         plt.pause(0.01)
         self.fig.canvas.draw()
 
@@ -993,7 +1006,6 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             print(f'{"=" * 60}')
             MemoryOptimizer.check_memory(threshold_mb=8000)
 
-            # ---------- amostras ----------
             size = min(self.sample_size, self.x_test.shape[0])
             fake_data = self.diffusion_model.sample(num_samples=size, training=False, verbose=False)
             if isinstance(fake_data, tf.Tensor):
@@ -1028,6 +1040,9 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                     'FID_500': fid_500, 'FRD_500': frd_500,
                     'KID_500': kid_500, 'KRD_500': krd_500
                 }
+                # libera memória dos extractors
+                del real_resized, fake_resized, act_train_iv3, act_gen_iv3, act_train_rc, act_gen_rc
+                gc.collect()
             except ImportError:
                 print("Warning: metrics.py not found. Using placeholder values.")
                 traditional_results = {
@@ -1043,6 +1058,10 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             self.display_metrics(epoch + 1, training_metrics, traditional_results, static_results)
             self.save_numpy_files()
             self.plot_static_metrics(epoch + 1, static_results, save_interval=self.save_interval)
+
+            # libera memória das amostras geradas
+            del fake_data
+            gc.collect()
 
     def compute_static_metrics_corrected(self, real_data, fake_data):
         print("Calculating static geostatistical metrics...")
@@ -1650,7 +1669,8 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write(f"  Dataset                 : {name}\n")
         f.write(f"  Training samples        : {len(x_train)}\n")
         f.write(f"  Test samples            : {len(x_test)}\n")
-        f.write(f"  FID/FRD sample size     : {FID_SAMPLE_SIZE}\n\n")
+        f.write(f"  FID/FRD sample size     : {FID_SAMPLE_SIZE}\n")
+        f.write(f"  Sample chunk size       : {SAMPLE_CHUNK_SIZE}\n\n")
 
         f.write("-" * 80 + "\n")
         f.write("GENERATED FILES\n")
@@ -1736,6 +1756,8 @@ print(f"Beta schedule: {beta_start} to {beta_end}")
 print(f"Save interval: {SAVE_INTERVAL} epochs")
 print(f"Metrics calculation interval: {SAVE_INTERVAL} epochs")
 print(f"FID/FRD sample size: {FID_SAMPLE_SIZE}")
+print(f"Sample chunk size: {SAMPLE_CHUNK_SIZE}")
+print(f"GPU allocator: {os.environ.get('TF_GPU_ALLOCATOR', 'default')}")
 print(f"Training samples: {len(x_train)}")
 print(f"Test samples: {len(x_test)}")
 print("=" * 60)
@@ -1780,6 +1802,8 @@ def save_execution_time(filename, execution_time):
         f.write(f"- Save interval: {SAVE_INTERVAL} epochs\n")
         f.write(f"- Metrics interval: {SAVE_INTERVAL} epochs\n")
         f.write(f"- FID/FRD sample size: {FID_SAMPLE_SIZE}\n")
+        f.write(f"- Sample chunk size: {SAMPLE_CHUNK_SIZE}\n")
+        f.write(f"- GPU allocator: {os.environ.get('TF_GPU_ALLOCATOR', 'default')}\n")
 
 
 save_execution_time("training_outputs/latent_diffusion_execution_time.txt", execution_time)
@@ -1922,7 +1946,9 @@ training_params = {
     'LR Scheduler': 'ReduceLROnPlateau (factor=0.5, patience=5)',
     'Metric interval': metric_interval,
     'Save interval': SAVE_INTERVAL,
-    'FID/FRD sample size': FID_SAMPLE_SIZE
+    'FID/FRD sample size': FID_SAMPLE_SIZE,
+    'Sample chunk size': SAMPLE_CHUNK_SIZE,
+    'GPU allocator': os.environ.get('TF_GPU_ALLOCATOR', 'default')
 }
 
 report_path = os.path.join('training_outputs', 'latent_diffusion_final_report.txt')
