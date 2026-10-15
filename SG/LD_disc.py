@@ -5,8 +5,8 @@ from tensorflow.keras import layers
 import matplotlib.pyplot as plt
 from tensorflow.keras.layers import LeakyReLU, BatchNormalization
 from tensorflow.keras.models import load_model
-from keras import Model
-from keras.applications.inception_v3 import InceptionV3
+from tensorflow.keras import Model
+from tensorflow.keras.applications.inception_v3 import InceptionV3
 from scipy.stats import gaussian_kde
 from scipy.spatial.distance import pdist, squareform
 from sklearn.decomposition import PCA
@@ -27,10 +27,8 @@ import warnings
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
-
 tf.keras.backend.clear_session()
 
-# Global matplotlib configuration
 plt.rcParams.update({
     'font.size': 20,
     'axes.titlesize': 24,
@@ -56,7 +54,6 @@ d_reg = 5
 metric_interval = 10
 name = '3facies_2d_80k'
 
-# Latent Diffusion specific parameters
 num_timesteps = 1000
 beta_start = 0.0001
 beta_end = 0.02
@@ -72,7 +69,7 @@ HIGH_RES_CONFIG = {
     'save_formats': ['png', 'svg']
 }
 
-# Data loading and preprocessing
+# Data loading
 X_train = np.load('datasets/Three_facies_2d.npy').astype('float32')
 
 if X_train.max() > 1.0:
@@ -214,18 +211,6 @@ def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
     return saved_files
 
 
-def get_feature_extractors():
-    iv3 = InceptionV3(include_top=False, pooling='avg', input_shape=(75, 75, 3))
-    f_extraction_iv3 = Model(inputs=iv3.input, outputs=iv3.layers[-1].output)
-    RC_full = load_model('Reservoir_classifier.h5')
-    f_extraction_rc = Model(inputs=RC_full.input,
-                            outputs=layers.GlobalAveragePooling2D()(RC_full.layers[-5].output))
-    return f_extraction_iv3, f_extraction_rc
-
-
-f_extraction_iv3, f_extraction_rc = get_feature_extractors()
-
-
 # ==============================================
 # LDM ARCHITECTURE
 # ==============================================
@@ -257,7 +242,6 @@ encoder = build_encoder((ni, nj, nz), latent_dim)
 
 
 def build_decoder(latent_dim, output_shape):
-    """Decoder with tanh - ORIGINAL from first code"""
     latent_inputs = keras.Input(shape=(latent_dim,))
     x = layers.Dense(6 * 6 * 256)(latent_inputs)
     x = LeakyReLU(alpha=0.2)(x)
@@ -302,42 +286,145 @@ def build_decoder_softmax(latent_dim, num_classes):
 decoder_softmax = build_decoder_softmax(latent_dim, num_classes)
 
 
-def build_unet_model(latent_dim, time_emb_dim=256):
+# ==============================================
+# REAL 1D UNET DENOISER
+# ==============================================
+
+def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
+    """
+    Real 1D UNet for latent diffusion denoising.
+
+    Treats the flattened latent vector (latent_dim,) as a 1D sequence of length
+    latent_dim with 1 channel, then applies an encoder / bottleneck / decoder
+    structure with skip connections.
+
+    Levels (for latent_dim=512, base_filters=64):
+        e0: 512 x 64
+        e1: 256 x 128
+        e2: 128 x 256
+        e3:  64 x 512
+        bottleneck: 64 x 512 (x2 residual blocks)
+        U3: 128 x 256   (skip from e2)
+        U2: 256 x 128   (skip from e1)
+        U1: 512 x 64    (skip from e0)
+        out: 512 x 1
+
+    Returns:
+        keras.Model([latent_input, time_input], output)
+        - latent_input: (B, latent_dim)
+        - time_input:   (B, 1)
+        - output:       (B, latent_dim)
+    """
+    assert latent_dim % 8 == 0, \
+        f"latent_dim must be divisible by 8 for 3 pooling levels (got {latent_dim})"
+
+    # ---------- Time embedding ----------
     def sinusoidal_embedding(x):
         half_dim = time_emb_dim // 2
         emb = tf.math.log(10000.0) / (half_dim - 1)
         emb = tf.exp(tf.range(half_dim, dtype=tf.float32) * -emb)
-        x_expanded = tf.cast(x, tf.float32)
-        emb = x_expanded * emb
-        sin_emb = tf.sin(emb)
-        cos_emb = tf.cos(emb)
-        full_emb = tf.concat([sin_emb, cos_emb], axis=1)
-        if time_emb_dim % 2 == 1:
-            full_emb = tf.pad(full_emb, [[0, 0], [0, 1]])
-        return full_emb
+        x = tf.cast(x, tf.float32)
+        emb = x * emb
+        return tf.concat([tf.sin(emb), tf.cos(emb)], axis=1)
 
-    latent_input = keras.Input(shape=(latent_dim,))
-    time_input = keras.Input(shape=(1,))
-    time_emb = sinusoidal_embedding(time_input)
-    time_emb = layers.Dense(time_emb_dim)(time_emb)
-    time_emb = layers.Activation("swish")(time_emb)
-    time_emb = layers.Dense(time_emb_dim)(time_emb)
-    x = layers.Dense(time_emb_dim)(latent_input)
-    x = layers.Add()([x, time_emb])
-    x = layers.Dense(1024)(x)
-    x = layers.LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.1)(x)
-    x = layers.Dense(1024)(x)
-    x = layers.LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.1)(x)
-    x = layers.Dense(512)(x)
-    x = layers.LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.1)(x)
-    output = layers.Dense(latent_dim)(x)
-    return keras.Model([latent_input, time_input], output, name="unet")
+    # ---------- Building blocks ----------
+    def time_mlp(t_emb):
+        x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_1")(t_emb)
+        x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_2")(x)
+        return x
+
+    def res_block(x, t_emb, filters, name):
+        """1D residual block with time conditioning (additive bias)."""
+        h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv1")(x)
+        h = layers.LayerNormalization(name=f"{name}_ln1")(h)
+        h = layers.Activation("swish", name=f"{name}_act1")(h)
+
+        # time conditioning: project t_emb to `filters` and broadcast over time
+        t = layers.Dense(filters, name=f"{name}_tproj")(t_emb)
+        t = layers.Reshape((1, filters), name=f"{name}_treshape")(t)
+        h = layers.Add(name=f"{name}_tadd")([h, t])
+
+        h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv2")(h)
+        h = layers.LayerNormalization(name=f"{name}_ln2")(h)
+
+        # residual projection if channel count changes
+        if x.shape[-1] != filters:
+            x = layers.Conv1D(filters, 1, padding="same", name=f"{name}_skip_proj")(x)
+
+        out = layers.Add(name=f"{name}_resadd")([x, h])
+        return layers.Activation("swish", name=f"{name}_out")(out)
+
+    def downsample(x, filters, name):
+        return layers.Conv1D(filters, 4, strides=2, padding="same", name=f"{name}_down")(x)
+
+    def upsample_with_skip(x, skip, filters, name):
+        x = layers.UpSampling1D(size=2, name=f"{name}_up")(x)
+        # sanity check
+        assert x.shape[1] == skip.shape[1], (
+            f"[{name}] upsampled length {x.shape[1]} != skip length {skip.shape[1]}. "
+
+        )
+        x = layers.Concatenate(name=f"{name}_concat")([x, skip])
+        x = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv")(x)
+        x = layers.LayerNormalization(name=f"{name}_ln")(x)
+        return layers.Activation("swish", name=f"{name}_act")(x)
+
+    # ---------- Inputs ----------
+    latent_input = keras.Input(shape=(latent_dim,), name="latent_input")
+    time_input = keras.Input(shape=(1,), name="time_input")
+
+    t_emb = sinusoidal_embedding(time_input)
+    t_emb = time_mlp(t_emb)
+
+    # Reshape (B, latent_dim) -> (B, latent_dim, 1)
+    x = layers.Reshape((latent_dim, 1), name="reshape_input")(latent_input)
+    x = layers.Conv1D(base_filters, 3, padding="same", name="input_conv")(x)
+
+    # ============ ENCODER ============
+    # e0: 512 x base
+    e0 = res_block(x, t_emb, base_filters, "enc0")
+
+    # e1: 256 x base*2
+    d1 = downsample(e0, base_filters * 2, "enc1_down")
+    e1 = res_block(d1, t_emb, base_filters * 2, "enc1")
+
+    # e2: 128 x base*4
+    d2 = downsample(e1, base_filters * 4, "enc2_down")
+    e2 = res_block(d2, t_emb, base_filters * 4, "enc2")
+
+    # e3: 64 x base*8
+    d3 = downsample(e2, base_filters * 8, "enc3_down")
+    e3 = res_block(d3, t_emb, base_filters * 8, "enc3")
+
+    # ============ BOTTLENECK ============
+    b = res_block(e3, t_emb, base_filters * 8, "bottleneck_1")
+    b = res_block(b, t_emb, base_filters * 8, "bottleneck_2")
+
+    # ============ DECODER (with skip connections) ============
+    # U3: 128 (skip from e2, which is at 128 with base*4 channels)
+    u3 = upsample_with_skip(b, e2, base_filters * 4, "dec3")
+    u3 = res_block(u3, t_emb, base_filters * 4, "dec3_res")
+
+    # U2: 256 (skip from e1, which is at 256 with base*2 channels)
+    u2 = upsample_with_skip(u3, e1, base_filters * 2, "dec2")
+    u2 = res_block(u2, t_emb, base_filters * 2, "dec2_res")
+
+    # U1: 512 (skip from e0, which is at 512 with base channels)
+    u1 = upsample_with_skip(u2, e0, base_filters, "dec1")
+    u1 = res_block(u1, t_emb, base_filters, "dec1_res")
+
+    # ============ OUTPUT ============
+    out = layers.Conv1D(base_filters, 3, padding="same", name="out_conv1")(u1)
+    out = layers.Activation("swish", name="out_act")(out)
+    out = layers.Conv1D(1, 3, padding="same", name="out_conv2")(out)
+
+    # (B, latent_dim, 1) -> (B, latent_dim)
+    out = layers.Reshape((latent_dim,), name="output_reshape")(out)
+
+    return keras.Model([latent_input, time_input], out, name="unet_1d")
 
 
-unet = build_unet_model(latent_dim)
+unet = build_unet_model(latent_dim, time_emb_dim=256, base_filters=64)
 
 
 class DiffusionModel(keras.Model):
@@ -446,9 +533,6 @@ class DiffusionModel(keras.Model):
             noisy_latents = self.q_sample(latents, t, noise)
             t_reshaped = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
             pred_noise = self.unet([noisy_latents, t_reshaped], training=True)
-            if pred_noise.shape != noise.shape:
-                if len(pred_noise.shape) == 3 and len(noise.shape) == 2:
-                    pred_noise = tf.squeeze(pred_noise, axis=1)
             diffusion_loss = tf.reduce_mean(tf.square(pred_noise - noise))
             reconstructed = self.decoder(latents, training=True)
             reconstruction_loss = tf.reduce_mean(tf.square(images - reconstructed))
@@ -486,9 +570,6 @@ class DiffusionModel(keras.Model):
         noisy_latents = self.q_sample(latents, t, noise)
         t_reshaped = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
         pred_noise = self.unet([noisy_latents, t_reshaped], training=False)
-        if pred_noise.shape != noise.shape:
-            if len(pred_noise.shape) == 3 and len(noise.shape) == 2:
-                pred_noise = tf.squeeze(pred_noise, axis=1)
         diffusion_loss = tf.reduce_mean(tf.square(pred_noise - noise))
         reconstructed = self.decoder(latents, training=False)
         reconstruction_loss = tf.reduce_mean(tf.square(images - reconstructed))
@@ -536,6 +617,12 @@ diffusion_model = DiffusionModel(
 dummy_input = tf.random.normal((1, ni, nj, nz))
 _ = diffusion_model(dummy_input)
 diffusion_model.compile()
+
+print("\n" + "=" * 60)
+print("UNET ARCHITECTURE SUMMARY")
+print("=" * 60)
+unet.summary()
+print("=" * 60 + "\n")
 
 
 # ==============================================
@@ -1054,9 +1141,6 @@ def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=No
 # FINAL TRAINING REPORT FUNCTION
 # ==============================================
 def generate_final_report(filepath, params, execution_time, loss_history, metrics_history, static_metrics_results):
-    """
-    Generates a complete final training report and saves it to a .txt file
-    """
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write("=" * 80 + "\n")
         f.write("               FINAL LATENT DIFFUSION TRAINING REPORT\n")
@@ -1157,12 +1241,15 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write(f"    Num Classes        : {num_classes}\n")
         f.write("    Output Act         : softmax\n\n")
 
-        f.write("  UNet (Diffusion):\n")
+        f.write("  UNet Denoiser (1D, real UNet):\n")
         f.write(f"    Input Dim          : {latent_dim}\n")
         f.write(f"    Time Emb Dim       : 256\n")
-        f.write("    Hidden Layers      : 1024, 1024, 512\n")
-        f.write("    Activation         : LeakyReLU (0.2), swish\n")
-        f.write("    Dropout            : 0.1\n\n")
+        f.write("    Structure          : 3-level encoder / bottleneck / 3-level decoder\n")
+        f.write("    Skip Connections   : Yes (e2 -> U3, e1 -> U2, e0 -> U1)\n")
+        f.write("    Encoder Channels   : 64 / 128 / 256 / 512\n")
+        f.write("    Bottleneck Ch.     : 512 (x2 residual blocks)\n")
+        f.write("    Residual Blocks    : LayerNorm + Conv1D + time-conditioning\n")
+        f.write("    Activation         : swish\n\n")
 
         f.write("  Diffusion:\n")
         f.write(f"    Timesteps          : {num_timesteps}\n")
@@ -1254,9 +1341,9 @@ start_time = time.time()
 print("\n" + "=" * 60)
 print("STARTING LATENT DIFFUSION TRAINING")
 print("=" * 60)
+print(f"Denoiser: REAL 1D UNET (3 encoder levels + bottleneck + 3 decoder levels)")
 print(f"Training with dual decoders (continuous + discrete)")
 print(f"Image generation: discrete (softmax + argmax)")
-print(f"Weight saving: first code style only")
 print("=" * 60)
 
 history = diffusion_model.fit(
@@ -1291,11 +1378,9 @@ print("\n" + "=" * 60)
 print("FINAL ANALYSIS AND SAVING")
 print("=" * 60)
 
-# Generate final samples
 test_samples = x_test[:5]
 latents = diffusion_model.encoder.predict(test_samples, verbose=0)
 
-# Get discrete reconstructions for visualization
 softmax_output = diffusion_model.decoder_softmax.predict(latents, verbose=0)
 discrete_output = np.argmax(softmax_output, axis=-1)
 reconstructions = discrete_output.astype(float) - 1.0
@@ -1303,12 +1388,10 @@ reconstructions = np.expand_dims(reconstructions, axis=-1)
 
 latent_samples = analyze_latent_space(diffusion_model.encoder, x_test, num_samples=1000)
 
-# Plot final distributions
 print("Saving final distribution plots...")
 saved_dist_files = plot_histograms_and_densities(test_samples, reconstructions, latent_samples)
 print(f"Saved final distribution plots: {len(saved_dist_files)} files")
 
-# Latent space visualization
 figsize = (14 * HIGH_RES_CONFIG['figsize_multiplier'], 7 * HIGH_RES_CONFIG['figsize_multiplier'])
 fig = plt.figure(figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
 z_samples = diffusion_model.encoder.predict(x_test[:1000], verbose=0)
@@ -1322,12 +1405,10 @@ plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
 save_figure_multiple_formats(fig, "training_outputs/latent_diffusion_latent_space_2d", HIGH_RES_CONFIG['dpi'])
 plt.close(fig)
 
-# Static metrics comparison
 static_metrics_results, saved_static_files = plot_static_metrics_comparison(
     x_test, diffusion_model, save_path_base='training_outputs/latent_diffusion_static_metrics_comparison'
 )
 
-# Save loss history
 with open('training_outputs/latent_diffusion_loss_history.txt', 'w') as f:
     f.write("Epoch\tTotal_Loss\tDiffusion_Loss\tRecon_Loss\tVal_Total_Loss\tVal_Diffusion_Loss\tVal_Recon_Loss\n")
     for i in range(len(loss_history_callback.total_losses)):
@@ -1339,7 +1420,6 @@ with open('training_outputs/latent_diffusion_loss_history.txt', 'w') as f:
                 f"{loss_history_callback.val_diffusion_losses[i]:.6f}\t"
                 f"{loss_history_callback.val_recon_losses[i]:.6f}\n")
 
-# SAVE WEIGHTS
 print("Saving model weights...")
 encoder.save_weights('training_outputs/latent_diffusion_encoder_weights.h5')
 decoder.save_weights('training_outputs/latent_diffusion_decoder_weights.h5')
@@ -1352,10 +1432,6 @@ encoder.save('training_outputs/latent_diffusion_encoder_model.h5')
 decoder.save('training_outputs/latent_diffusion_decoder_model.h5')
 decoder_softmax.save('training_outputs/latent_diffusion_decoder_softmax_model.h5')
 unet.save('training_outputs/latent_diffusion_unet_model.h5')
-
-# ==============================================
-# GENERATE AND SAVE FINAL REPORT
-# ==============================================
 
 training_params = {
     'Dataset': name,
@@ -1373,7 +1449,10 @@ training_params = {
     'Beta end': beta_end,
     'Training samples': len(x_train),
     'Test samples': len(x_test),
-    'Model': 'Latent Diffusion with dual decoders',
+    'Model': 'Latent Diffusion with real 1D UNet denoiser',
+    'UNet structure': 'Encoder(3) + Bottleneck(2x) + Decoder(3) with skip connections',
+    'UNet base filters': 64,
+    'UNet time emb dim': 256,
     'Optimizer': 'Adam (beta1=0.5, clipnorm=1.0)',
     'Early Stopping': 'Yes (patience=20, monitor=val_loss)',
     'LR Scheduler': 'ReduceLROnPlateau (factor=0.5, patience=5)',
