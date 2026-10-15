@@ -61,11 +61,12 @@ num_timesteps = 1000
 beta_start = 0.0001
 beta_end = 0.02
 
-# FID/FRD só usam [:500], então gerar 500 amostras é suficiente.
-FID_SAMPLE_SIZE = 500
+# FID/FRD usam as N primeiras amostras. Reduzir N acelera proporcionalmente.
+FID_SAMPLE_SIZE = 256
 
-# Chunk size para o sampling — reduz pico de memória do UNet em ~8x.
-SAMPLE_CHUNK_SIZE = 32
+# Chunk size para o sampling. Menor = menos VRAM, mas mais overhead de Python.
+# 64 é o ponto ótimo na 3060 (10GB).
+SAMPLE_CHUNK_SIZE = 64
 
 HIGH_RES_CONFIG = {
     'dpi': 300,
@@ -103,6 +104,7 @@ print(f"Diffusion steps: {num_timesteps}")
 print(f"Number of classes: {num_classes}")
 print(f"FID/FRD sample size: {FID_SAMPLE_SIZE}")
 print(f"Sample chunk size: {SAMPLE_CHUNK_SIZE}")
+print(f"GPU allocator: {os.environ.get('TF_GPU_ALLOCATOR', 'default')}")
 print(f"{'=' * 60}\n")
 
 
@@ -479,11 +481,6 @@ class DiffusionModel(keras.Model):
             return model_mean + tf.sqrt(posterior_variance_t) * noise
 
     def sample(self, num_samples, training=False, verbose=True, chunk_size=SAMPLE_CHUNK_SIZE):
-        """
-        Geração em chunks para evitar picos de memória no GPU.
-        Cada chunk roda o loop de difusão completo e é concatenado no final.
-        Nenhum resultado muda — apenas o pico de VRAM cai ~ (batch/chunk_size) vezes.
-        """
         if verbose:
             print(f"\nGenerating {num_samples} discrete samples (chunk_size={chunk_size})...")
 
@@ -505,9 +502,7 @@ class DiffusionModel(keras.Model):
             gen = tf.expand_dims(gen, axis=-1).numpy()
             all_generated.append(gen)
 
-            # libera tensores intermediários do chunk atual
             del x, softmax_output, discrete_output, gen
-            tf.keras.backend.clear_session()  # NÃO — não limpar aqui, quebra pesos
             gc.collect()
 
         generated_images = np.concatenate(all_generated, axis=0)
@@ -769,7 +764,6 @@ class DistributionPlotCallback(tf.keras.callbacks.Callback):
             else:
                 print(f"Displayed distribution plots at epoch {epoch + 1} (not saved)")
 
-            # libera memória após o callback
             del latents, softmax_output, discrete_output, reconstructions, latent_samples
             gc.collect()
 
@@ -816,7 +810,6 @@ class LivePlotCallback(keras.callbacks.Callback):
         else:
             print(f"Displayed epoch {epoch + 1} plot (not saved)")
 
-        # libera memória após o callback
         del latents, softmax_output, discrete_output, reconstructed_imgs
         gc.collect()
 
@@ -836,6 +829,10 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
         self.save_interval = save_interval
         self.sample_size = sample_size
         self.log_file = log_file
+        # Cache para features do dataset real (não mudam entre callbacks)
+        self._real_features_iv3 = None
+        self._real_features_rc = None
+        self._cached_size = None
         self.metrics = {
             'FID_10k': [], 'FRD_10k': [], 'KID_10k': [], 'KRD_10k': [],
             'FID_500': [], 'FRD_500': [], 'KID_500': [], 'KRD_500': []
@@ -849,12 +846,36 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                     "FID_500\tFRD_500\tKID_500\tKRD_500\t"
                     "Variogram_MSE\tConnectivity_MSE\tHistogram_KL\tPCA_Correlation\tMDS_MMD\n")
 
+    def on_train_begin(self, logs=None):
+        """
+        Pré-computa as features reais do dataset de teste uma única vez.
+        Elas não mudam entre épocas, então computar em cada callback
+        desperdiça ~30% do tempo total de FID/FRD.
+        """
+        size = min(self.sample_size, self.x_test.shape[0])
+        print(f"\n[EnhancedMetricCallback] Pré-computando features reais (size={size})...")
+        t0 = time.time()
+
+        # x_test é discreto {-1, 0, 1} com shape (B, H, W, 1). Para o IV3, precisa
+        # ser (B, 75, 75, 3). Replicamos o canal 1 em 3.
+        real_resized = tf.image.resize(np.repeat(self.x_test[:size], 3, axis=3), [75, 75])
+        self._real_features_iv3 = f_extraction_iv3.predict(real_resized, batch_size=128, verbose=0)
+        self._real_features_rc = f_extraction_rc.predict(self.x_test[:size], batch_size=128, verbose=0)
+
+        del real_resized
+        gc.collect()
+
+        self._cached_size = size
+        print(f"[EnhancedMetricCallback] Features reais em cache. Tempo: {time.time() - t0:.1f}s\n")
+
     def on_epoch_end(self, epoch, logs=None):
         if (epoch + 1) % self.metric_interval == 0:
             print(f'\n{"=" * 60}')
             print(f'Latent Diffusion: Computing metrics at epoch {epoch + 1}')
             print(f'{"=" * 60}')
             MemoryOptimizer.check_memory(threshold_mb=8000)
+
+            t0 = time.time()
 
             size = min(self.sample_size, self.x_test.shape[0])
             fake_data = self.diffusion_model.sample(num_samples=size, training=False, verbose=False)
@@ -863,7 +884,12 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             if np.any(np.isnan(fake_data)):
                 fake_data = np.nan_to_num(fake_data, nan=0.0)
 
+            t_sample = time.time() - t0
+            print(f"  Sampling: {t_sample:.1f}s")
+
+            # Static metrics (usa só numpy, rápido)
             static_results = self.compute_static_metrics_corrected(self.x_test[:size], fake_data[:size])
+
             training_metrics = {
                 'total_loss': logs.get('loss', 0),
                 'diffusion_loss': logs.get('diffusion_loss', 0),
@@ -871,26 +897,40 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             }
 
             # ---------- FID/FRD/KID/KRD ----------
+            t1 = time.time()
             try:
                 from metrics import frechet_distance, kernel_distance
-                real_resized = tf.image.resize(np.repeat(self.x_test[:size], 3, axis=3), [75, 75])
+
+                # Reutiliza features reais em cache (on_train_begin)
+                if self._real_features_iv3 is None or self._cached_size != size:
+                    # fallback (não deveria acontecer, mas por segurança)
+                    real_resized = tf.image.resize(np.repeat(self.x_test[:size], 3, axis=3), [75, 75])
+                    self._real_features_iv3 = f_extraction_iv3.predict(real_resized, batch_size=128, verbose=0)
+                    self._real_features_rc = f_extraction_rc.predict(self.x_test[:size], batch_size=128, verbose=0)
+                    self._cached_size = size
+                    del real_resized
+                    gc.collect()
+
+                # Só computa features das amostras geradas
                 fake_resized = tf.image.resize(np.repeat(fake_data, 3, axis=3), [75, 75])
-                act_train_iv3 = f_extraction_iv3.predict(real_resized, verbose=0)
-                act_gen_iv3 = f_extraction_iv3.predict(fake_resized, verbose=0)
-                act_train_rc = f_extraction_rc.predict(self.x_test[:size], verbose=0)
-                act_gen_rc = f_extraction_rc.predict(fake_data, verbose=0)
-                fid_500 = frechet_distance(act_train_iv3[:500], act_gen_iv3[:500])
-                frd_500 = frechet_distance(act_train_rc[:500], act_gen_rc[:500])
-                kid_500 = kernel_distance(act_train_iv3[:500], act_gen_iv3[:500],
-                                          num_blocks=50, max_block_size=500)
-                krd_500 = kernel_distance(act_train_rc[:500], act_gen_rc[:500],
-                                          num_blocks=50, max_block_size=500)
+                act_gen_iv3 = f_extraction_iv3.predict(fake_resized, batch_size=128, verbose=0)
+                act_gen_rc = f_extraction_rc.predict(fake_data, batch_size=128, verbose=0)
+
+                act_train_iv3 = self._real_features_iv3
+                act_train_rc = self._real_features_rc
+
+                n = min(256, len(act_train_iv3), len(act_gen_iv3))
+                fid_500 = frechet_distance(act_train_iv3[:n], act_gen_iv3[:n])
+                frd_500 = frechet_distance(act_train_rc[:n], act_gen_rc[:n])
+                kid_500 = kernel_distance(act_train_iv3[:n], act_gen_iv3[:n],
+                                          num_blocks=50, max_block_size=n)
+                krd_500 = kernel_distance(act_train_rc[:n], act_gen_rc[:n],
+                                          num_blocks=50, max_block_size=n)
                 traditional_results = {
                     'FID_500': fid_500, 'FRD_500': frd_500,
                     'KID_500': kid_500, 'KRD_500': krd_500
                 }
-                # libera memória dos extractors
-                del real_resized, fake_resized, act_train_iv3, act_gen_iv3, act_train_rc, act_gen_rc
+                del fake_resized, act_gen_iv3, act_gen_rc
                 gc.collect()
             except ImportError:
                 print("Warning: metrics.py not found. Using placeholder values.")
@@ -898,6 +938,10 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                     'FID_500': 0, 'FRD_500': 0,
                     'KID_500': 0, 'KRD_500': 0
                 }
+
+            t_fid = time.time() - t1
+            print(f"  FID/FRD/KID/KRD: {t_fid:.1f}s")
+            print(f"  Total callback time: {t_sample + t_fid:.1f}s")
 
             for key in ['FID_500', 'FRD_500', 'KID_500', 'KRD_500']:
                 self.metrics[key].append(traditional_results[key])
@@ -908,7 +952,6 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             self.save_numpy_files()
             self.plot_static_metrics(epoch + 1, static_results, save_interval=self.save_interval)
 
-            # libera memória das amostras geradas
             del fake_data
             gc.collect()
 
@@ -1185,6 +1228,7 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write("=" * 80 + "\n")
         f.write("               FINAL LATENT DIFFUSION TRAINING REPORT\n")
         f.write("=" * 80 + "\n\n")
+
         f.write(f"Date/Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
         f.write("-" * 80 + "\n")
@@ -1204,6 +1248,7 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write("-" * 80 + "\n")
         f.write("TRAINING METRICS (FINAL VALUES)\n")
         f.write("-" * 80 + "\n")
+
         if loss_history.total_losses:
             last_epoch = len(loss_history.total_losses)
             f.write(f"  Total epochs trained: {last_epoch}\n\n")
@@ -1211,19 +1256,26 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
             f.write(f"    Total Loss       : {loss_history.total_losses[-1]:.6f}\n")
             f.write(f"    Diffusion Loss   : {loss_history.diffusion_losses[-1]:.6f}\n")
             f.write(f"    Reconstruction   : {loss_history.recon_losses[-1]:.6f}\n\n")
+
             f.write("  Validation Losses (last epoch):\n")
             f.write(f"    Total Loss       : {loss_history.val_total_losses[-1]:.6f}\n")
             f.write(f"    Diffusion Loss   : {loss_history.val_diffusion_losses[-1]:.6f}\n")
             f.write(f"    Reconstruction   : {loss_history.val_recon_losses[-1]:.6f}\n\n")
+
             f.write("  Best values during training:\n")
-            f.write(f"    Lowest Total Loss (train)      : {min(loss_history.total_losses):.6f} (epoch {np.argmin(loss_history.total_losses) + 1})\n")
-            f.write(f"    Lowest Total Loss (val)        : {min(loss_history.val_total_losses):.6f} (epoch {np.argmin(loss_history.val_total_losses) + 1})\n")
-            f.write(f"    Lowest Diffusion Loss (train)  : {min(loss_history.diffusion_losses):.6f} (epoch {np.argmin(loss_history.diffusion_losses) + 1})\n")
-            f.write(f"    Lowest Recon Loss (train)      : {min(loss_history.recon_losses):.6f} (epoch {np.argmin(loss_history.recon_losses) + 1})\n\n")
+            f.write(
+                f"    Lowest Total Loss (train)      : {min(loss_history.total_losses):.6f} (epoch {np.argmin(loss_history.total_losses) + 1})\n")
+            f.write(
+                f"    Lowest Total Loss (val)        : {min(loss_history.val_total_losses):.6f} (epoch {np.argmin(loss_history.val_total_losses) + 1})\n")
+            f.write(
+                f"    Lowest Diffusion Loss (train)  : {min(loss_history.diffusion_losses):.6f} (epoch {np.argmin(loss_history.diffusion_losses) + 1})\n")
+            f.write(
+                f"    Lowest Recon Loss (train)      : {min(loss_history.recon_losses):.6f} (epoch {np.argmin(loss_history.recon_losses) + 1})\n\n")
 
         f.write("-" * 80 + "\n")
         f.write("TRADITIONAL METRICS (LAST EVALUATION)\n")
         f.write("-" * 80 + "\n")
+
         if hasattr(metrics_history, 'metrics'):
             for key, values in metrics_history.metrics.items():
                 if values:
@@ -1233,6 +1285,7 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write("-" * 80 + "\n")
         f.write("GEOSTATISTICAL METRICS (LAST EVALUATION)\n")
         f.write("-" * 80 + "\n")
+
         if hasattr(metrics_history, 'static_metrics'):
             for key, values in metrics_history.static_metrics.items():
                 if values:
@@ -1258,16 +1311,19 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write("    Dense Layer        : 256\n")
         f.write("    Dropout            : 0.4 / 0.3\n")
         f.write("    BatchNormalization : Yes\n\n")
+
         f.write("  Decoder (tanh):\n")
         f.write(f"    Input Dim          : {latent_dim}\n")
         f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
         f.write("    Output Act         : tanh\n")
         f.write("    Dropout            : 0.2\n\n")
+
         f.write("  Decoder (softmax):\n")
         f.write(f"    Input Dim          : {latent_dim}\n")
         f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
         f.write(f"    Num Classes        : {num_classes}\n")
         f.write("    Output Act         : softmax\n\n")
+
         f.write("  UNet Denoiser (1D, real UNet):\n")
         f.write(f"    Input Dim          : {latent_dim}\n")
         f.write(f"    Time Emb Dim       : 256\n")
@@ -1277,6 +1333,7 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write("    Bottleneck Ch.     : 512 (x2 residual blocks)\n")
         f.write("    Residual Blocks    : LayerNorm + Conv1D + time-conditioning\n")
         f.write("    Activation         : swish\n\n")
+
         f.write("  Diffusion:\n")
         f.write(f"    Timesteps          : {num_timesteps}\n")
         f.write(f"    Beta Start         : {beta_start}\n")
@@ -1285,10 +1342,12 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write("-" * 80 + "\n")
         f.write("FINAL SUMMARY\n")
         f.write("-" * 80 + "\n")
-        f.write(f"  Training status         : {'COMPLETED' if len(loss_history.total_losses) == epochs else 'INTERRUPTED (Early Stopping)'}\n")
+        f.write(
+            f"  Training status         : {'COMPLETED' if len(loss_history.total_losses) == epochs else 'INTERRUPTED (Early Stopping)'}\n")
         f.write(f"  Epochs executed         : {len(loss_history.total_losses)}\n")
         f.write(f"  Total time              : {execution_time / 3600:.2f} hours\n")
-        f.write(f"  Average time per epoch  : {(execution_time / len(loss_history.total_losses)) if loss_history.total_losses else 0:.2f} seconds\n")
+        f.write(
+            f"  Average time per epoch  : {(execution_time / len(loss_history.total_losses)) if loss_history.total_losses else 0:.2f} seconds\n")
         f.write(f"  Dataset                 : {name}\n")
         f.write(f"  Training samples        : {len(x_train)}\n")
         f.write(f"  Test samples            : {len(x_test)}\n")
