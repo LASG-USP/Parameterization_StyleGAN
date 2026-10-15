@@ -5,8 +5,8 @@ from tensorflow.keras import layers
 import matplotlib.pyplot as plt
 from tensorflow.keras.layers import LeakyReLU, BatchNormalization
 from tensorflow.keras.models import load_model
-from tensorflow.keras import Model
-from tensorflow.keras.applications.inception_v3 import InceptionV3
+from keras import Model
+from keras.applications.inception_v3 import InceptionV3
 from scipy.stats import gaussian_kde
 from scipy.spatial.distance import pdist, squareform
 from sklearn.decomposition import PCA
@@ -24,11 +24,12 @@ from scipy.stats import entropy
 from sklearn.metrics import pairwise_kernels
 from sklearn.impute import SimpleImputer
 import warnings
+import glob
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
-tf.keras.backend.clear_session()
 
+# Global matplotlib configuration
 plt.rcParams.update({
     'font.size': 20,
     'axes.titlesize': 24,
@@ -42,6 +43,20 @@ plt.rcParams.update({
     'font.family': 'sans-serif',
 })
 
+# Fully clear TensorFlow session
+tf.keras.backend.clear_session()
+gc.collect()
+
+# Configure GPU
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"Available GPUs: {len(gpus)}")
+    except RuntimeError as e:
+        print(e)
+
 # Configuration
 zdim = 512
 epochs = 150
@@ -52,8 +67,9 @@ gamma = 0.1
 alpha = 0.2
 d_reg = 5
 metric_interval = 10
-name = '3facies_2d_80k'
+name = 'unisim_ii_cropped'
 
+# Latent Diffusion specific parameters
 num_timesteps = 1000
 beta_start = 0.0001
 beta_end = 0.02
@@ -69,33 +85,37 @@ HIGH_RES_CONFIG = {
     'save_formats': ['png', 'svg']
 }
 
-# Data loading
-X_train = np.load('datasets/Three_facies_2d.npy').astype('float32')
+# Load dataset
+if name == 'channel2d_large':
+    X_train = np.load('datasets/Two_facies_channel_2d.npy').astype('float32')
 
-if X_train.max() > 1.0:
-    X_train = (X_train - X_train.min()) / (X_train.max() - X_train.min()) * 2 - 1
+elif name == '3facies_2d_80k':
+    X_train = np.load('datasets/Three_facies_2d.npy').astype('float32')
 
-train_size = int(0.9 * len(X_train))
-x_train = X_train[:train_size]
-x_test = X_train[train_size:]
+elif name == 'unisim_ii_cropped':
+    X_train = np.load('D:/PycharmProjects/GAN/simfiles/Perm_ensemble_cropped.npy')
+    X_train[X_train < 1] = 1
+    X_train = np.log(X_train)
+    X_train = 2 * (X_train - X_train.min()) / (X_train.max() - X_train.min()) - 1
+    X_train = X_train[..., np.newaxis]
+    X_train = X_train.astype('float32')
+
+noise = np.random.normal(0, 1, (5 * 5, zdim)).astype('float32')
+ni = X_train.shape[1]
+nj = X_train.shape[2]
+nz = X_train.shape[3]
+
+# Split data into train and test
+train_size = int(0.8 * len(X_train))
+x_train = X_train[:train_size].astype('float32')
+x_test = X_train[train_size:].astype('float32')
 
 latent_dim = zdim
-ni, nj, nz = X_train.shape[1], X_train.shape[2], X_train.shape[3]
-num_classes = 3
-
-print(f"\n{'=' * 60}")
-print(f"DATASET INFO")
-print(f"{'=' * 60}")
-print(f"Image shape: {ni} x {nj} x {nz}")
-print(f"Training samples: {len(x_train)}")
-print(f"Test samples: {len(x_test)}")
-print(f"Latent dimension: {latent_dim}")
-print(f"Diffusion steps: {num_timesteps}")
-print(f"Number of classes: {num_classes}")
-print(f"{'=' * 60}\n")
 
 
 class MemoryOptimizer:
+    """Class for memory optimization during training."""
+
     @staticmethod
     def memory_usage():
         process = psutil.Process()
@@ -105,6 +125,12 @@ class MemoryOptimizer:
     def clear_memory():
         tf.keras.backend.clear_session()
         gc.collect()
+
+    @staticmethod
+    def batch_generator(data, batch_size):
+        n_samples = len(data)
+        for i in range(0, n_samples, batch_size):
+            yield data[i:i + batch_size]
 
     @staticmethod
     def check_memory(threshold_mb=8000):
@@ -117,6 +143,36 @@ class MemoryOptimizer:
 
 
 class StaticMetrics:
+    """Class for calculating static geostatistical metrics."""
+
+    @staticmethod
+    def variogram_2d(data, lag_distances=None, max_lag=None):
+        if len(data.shape) == 4:
+            data = data[..., 0]
+        n_samples, height, width = data.shape[:3]
+        if lag_distances is None:
+            if max_lag is None:
+                max_lag = min(height, width) // 2
+            lag_distances = np.arange(1, max_lag + 1)
+        variogram = np.zeros(len(lag_distances))
+        counts = np.zeros(len(lag_distances))
+        for i in range(height):
+            for j in range(width):
+                for k, lag in enumerate(lag_distances):
+                    if j + lag < width:
+                        for sample in range(n_samples):
+                            diff = data[sample, i, j] - data[sample, i, j + lag]
+                            variogram[k] += diff ** 2
+                            counts[k] += 1
+                    if i + lag < height:
+                        for sample in range(n_samples):
+                            diff = data[sample, i, j] - data[sample, i + lag, j]
+                            variogram[k] += diff ** 2
+                            counts[k] += 1
+        variogram = variogram / (2 * counts)
+        variogram[counts == 0] = 0
+        return lag_distances, variogram
+
     @staticmethod
     def variogram_2d_optimized(data, lag_distances=None, max_lag=None):
         if len(data.shape) == 4:
@@ -191,6 +247,122 @@ class StaticMetrics:
         mds_features = mds.fit_transform(data_pca)
         return mds_features
 
+    @staticmethod
+    def calculate_histogram_stats(data, bins=100):
+        if len(data.shape) == 4:
+            data = data[..., 0].flatten()
+        else:
+            data = data.flatten()
+        hist, bin_edges = np.histogram(data, bins=bins, density=True)
+        mean = np.mean(data)
+        std = np.std(data)
+        skew = np.mean(((data - mean) / std) ** 3) if std > 0 else 0
+        kurtosis = np.mean(((data - mean) / std) ** 4) if std > 0 else 0
+        return {
+            'histogram': hist,
+            'bin_edges': bin_edges,
+            'mean': mean,
+            'std': std,
+            'skewness': skew,
+            'kurtosis': kurtosis
+        }
+
+    @staticmethod
+    def compute_all_metrics(real_data, fake_data, threshold=0.5, max_lag=25):
+        metrics = {}
+        print("Calculating variograms...")
+        lags, variogram_real = StaticMetrics.variogram_2d_optimized(real_data[:100], max_lag=max_lag)
+        _, variogram_fake = StaticMetrics.variogram_2d_optimized(fake_data[:100], max_lag=max_lag)
+        metrics['variogram_lags'] = lags
+        metrics['variogram_real'] = variogram_real
+        metrics['variogram_fake'] = variogram_fake
+        metrics['variogram_mse'] = np.mean((variogram_real - variogram_fake) ** 2)
+        print("Calculating connectivity functions...")
+        _, connectivity_real = StaticMetrics.connectivity_function(
+            real_data[:100], threshold, lag_distances=lags
+        )
+        _, connectivity_fake = StaticMetrics.connectivity_function(
+            fake_data[:100], threshold, lag_distances=lags
+        )
+        metrics['connectivity_real'] = connectivity_real
+        metrics['connectivity_fake'] = connectivity_fake
+        metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
+        print("Calculating PCA...")
+        pca_real, var_ratio_real = StaticMetrics.calculate_pca_features(real_data[:500])
+        pca_fake, var_ratio_fake = StaticMetrics.calculate_pca_features(fake_data[:500])
+        if pca_real.shape[0] == pca_fake.shape[0]:
+            n_components = min(2, pca_real.shape[1], pca_fake.shape[1])
+            pca_correlations = []
+            for i in range(n_components):
+                corr = np.corrcoef(pca_real[:, i], pca_fake[:, i])[0, 1]
+                pca_correlations.append(corr)
+            metrics['pca_correlation'] = np.mean(pca_correlations)
+        else:
+            metrics['pca_correlation'] = 0.0
+        metrics['pca_real'] = pca_real[:, :2]
+        metrics['pca_fake'] = pca_fake[:, :2]
+        metrics['pca_var_ratio_real'] = var_ratio_real
+        metrics['pca_var_ratio_fake'] = var_ratio_fake
+        print("Calculating MDS...")
+        mds_real = StaticMetrics.calculate_mds_features(real_data[:500])
+        mds_fake = StaticMetrics.calculate_mds_features(fake_data[:500])
+        from sklearn.metrics.pairwise import rbf_kernel
+        n_samples = min(len(mds_real), len(mds_fake), 100)
+        mds_real_small = mds_real[:n_samples]
+        mds_fake_small = mds_fake[:n_samples]
+        if len(mds_real_small) > 0 and len(mds_fake_small) > 0:
+            X = np.vstack([mds_real_small, mds_fake_small])
+            pairwise_dists = pdist(X)
+            gamma = 1.0 / (2.0 * np.median(pairwise_dists) ** 2) if len(pairwise_dists) > 0 else 1.0
+            K_XX = rbf_kernel(mds_real_small, mds_real_small, gamma=gamma)
+            K_YY = rbf_kernel(mds_fake_small, mds_fake_small, gamma=gamma)
+            K_XY = rbf_kernel(mds_real_small, mds_fake_small, gamma=gamma)
+            mmd_squared = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
+            metrics['mds_mmd'] = np.sqrt(max(mmd_squared, 0))
+        else:
+            metrics['mds_mmd'] = 0.0
+        metrics['mds_real'] = mds_real
+        metrics['mds_fake'] = mds_fake
+        print("Calculating histogram statistics (CORRECTED)...")
+        real_flat = real_data.flatten()
+        fake_flat = fake_data.flatten()
+        all_data = np.concatenate([real_flat, fake_flat])
+        data_min, data_max = np.min(all_data), np.max(all_data)
+        hist_real, bin_edges = np.histogram(real_flat, bins=100, range=(data_min, data_max), density=False)
+        hist_fake, _ = np.histogram(fake_flat, bins=100, range=(data_min, data_max), density=False)
+        hist_real = hist_real.astype(float) / np.sum(hist_real)
+        hist_fake = hist_fake.astype(float) / np.sum(hist_fake)
+        epsilon = 1e-10
+        hist_real = np.clip(hist_real, epsilon, 1)
+        hist_fake = np.clip(hist_fake, epsilon, 1)
+        kl_divergence = np.sum(hist_real * np.log(hist_real / hist_fake))
+        mean = np.mean(real_flat)
+        std = np.std(real_flat)
+        skew = np.mean(((real_flat - mean) / std) ** 3) if std > 0 else 0
+        kurtosis = np.mean(((real_flat - mean) / std) ** 4) if std > 0 else 0
+        metrics['hist_stats_real'] = {
+            'histogram': hist_real,
+            'bin_edges': bin_edges,
+            'mean': mean,
+            'std': std,
+            'skewness': skew,
+            'kurtosis': kurtosis
+        }
+        fake_mean = np.mean(fake_flat)
+        fake_std = np.std(fake_flat)
+        fake_skew = np.mean(((fake_flat - fake_mean) / fake_std) ** 3) if fake_std > 0 else 0
+        fake_kurtosis = np.mean(((fake_flat - fake_mean) / fake_std) ** 4) if fake_std > 0 else 0
+        metrics['hist_stats_fake'] = {
+            'histogram': hist_fake,
+            'bin_edges': bin_edges,
+            'mean': fake_mean,
+            'std': fake_std,
+            'skewness': fake_skew,
+            'kurtosis': fake_kurtosis
+        }
+        metrics['hist_kl'] = kl_divergence
+        return metrics
+
 
 def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
     if formats is None:
@@ -224,29 +396,29 @@ f_extraction_iv3, f_extraction_rc = get_feature_extractors()
 
 
 # ==============================================
-# LDM ARCHITECTURE
+# LATENT DIFFUSION MODEL ARCHITECTURE
 # ==============================================
 
 def build_encoder(input_shape, latent_dim):
-    inputs = keras.Input(shape=input_shape)
-    x = layers.Conv2D(32, 3, strides=2, padding="same")(inputs)
+    inputs = keras.Input(shape=input_shape, dtype=tf.float32)
+    x = layers.Conv2D(32, 3, strides=2, padding="same", dtype=tf.float32)(inputs)
     x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2D(64, 3, strides=2, padding="same")(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2D(64, 3, strides=2, padding="same", dtype=tf.float32)(x)
     x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2D(128, 3, strides=2, padding="same")(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2D(128, 3, strides=2, padding="same", dtype=tf.float32)(x)
     x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2D(256, 3, strides=2, padding="same")(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2D(256, 3, strides=2, padding="same", dtype=tf.float32)(x)
     x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
     x = layers.Dropout(0.4)(x)
     x = layers.Flatten()(x)
-    x = layers.Dense(256)(x)
+    x = layers.Dense(256, dtype=tf.float32)(x)
     x = LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.3)(x)
-    latent_output = layers.Dense(latent_dim, name="latent_output")(x)
+    latent_output = layers.Dense(latent_dim, name="latent_output", dtype=tf.float32)(x)
     return keras.Model(inputs, latent_output, name="encoder")
 
 
@@ -254,49 +426,25 @@ encoder = build_encoder((ni, nj, nz), latent_dim)
 
 
 def build_decoder(latent_dim, output_shape):
-    """Decoder with tanh - ORIGINAL from first code"""
-    latent_inputs = keras.Input(shape=(latent_dim,))
-    x = layers.Dense(6 * 6 * 256)(latent_inputs)
+    latent_inputs = keras.Input(shape=(latent_dim,), dtype=tf.float32)
+    x = layers.Dense(6 * 6 * 256, dtype=tf.float32)(latent_inputs)
     x = LeakyReLU(alpha=0.2)(x)
     x = layers.Dropout(0.2)(x)
     x = layers.Reshape((6, 6, 256))(x)
-    x = layers.Conv2DTranspose(128, 3, strides=2, padding="same")(x)
+    x = layers.Conv2DTranspose(128, 3, strides=2, padding="same", dtype=tf.float32)(x)
     x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2DTranspose(64, 3, strides=2, padding="same")(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2DTranspose(64, 3, strides=2, padding="same", dtype=tf.float32)(x)
     x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2DTranspose(32, 3, strides=2, padding="same")(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2DTranspose(32, 3, strides=2, padding="same", dtype=tf.float32)(x)
     x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
-    outputs = layers.Conv2D(output_shape[-1], 3, activation="tanh", padding="same")(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    outputs = layers.Conv2D(output_shape[-1], 3, activation="tanh", padding="same", dtype=tf.float32)(x)
     return keras.Model(latent_inputs, outputs, name="decoder")
 
 
 decoder = build_decoder(latent_dim, (ni, nj, nz))
-
-
-def build_decoder_softmax(latent_dim, num_classes):
-    """Decoder with softmax for discrete generation"""
-    latent_inputs = keras.Input(shape=(latent_dim,))
-    x = layers.Dense(6 * 6 * 256)(latent_inputs)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.2)(x)
-    x = layers.Reshape((6, 6, 256))(x)
-    x = layers.Conv2DTranspose(128, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2DTranspose(64, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv2DTranspose(32, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization()(x)
-    outputs = layers.Conv2D(num_classes, 3, activation="softmax", padding="same", name="output_softmax")(x)
-    return keras.Model(latent_inputs, outputs, name="decoder_softmax")
-
-
-decoder_softmax = build_decoder_softmax(latent_dim, num_classes)
 
 
 # ==============================================
@@ -311,7 +459,7 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
         e0: 512 x 64
         e1: 256 x 128
         e2: 128 x 256
-        e3:  64 x 512   <- entrada do bottleneck
+        e3:  64 x 512   <- bottleneck input
         bottleneck: 64 x 512 (x2 residual blocks)
         U3: 128 x 256   (skip from e2)
         U2: 256 x 128   (skip from e1)
@@ -366,8 +514,8 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
         x = layers.LayerNormalization(name=f"{name}_ln")(x)
         return layers.Activation("swish", name=f"{name}_act")(x)
 
-    latent_input = keras.Input(shape=(latent_dim,), name="latent_input")
-    time_input = keras.Input(shape=(1,), name="time_input")
+    latent_input = keras.Input(shape=(latent_dim,), dtype=tf.float32, name="latent_input")
+    time_input = keras.Input(shape=(1,), dtype=tf.float32, name="time_input")
 
     t_emb = sinusoidal_embedding(time_input)
     t_emb = time_mlp(t_emb)
@@ -388,7 +536,7 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
     b = res_block(e3, t_emb, base_filters * 8, "bottleneck_1")
     b = res_block(b, t_emb, base_filters * 8, "bottleneck_2")
 
-    # DECODER with correct skips
+    # DECODER (with correct skips)
     u3 = upsample_with_skip(b, e2, base_filters * 4, "dec3")
     u3 = res_block(u3, t_emb, base_filters * 4, "dec3_res")
 
@@ -411,19 +559,16 @@ unet = build_unet_model(latent_dim, time_emb_dim=256, base_filters=64)
 
 
 class DiffusionModel(keras.Model):
-    """Latent Diffusion Model with dual decoders."""
+    """Latent Diffusion Model for generation."""
 
-    def __init__(self, encoder, decoder, decoder_softmax, unet, num_timesteps=1000,
+    def __init__(self, encoder, decoder, unet, num_timesteps=1000,
                  beta_start=0.0001, beta_end=0.02, **kwargs):
         super().__init__(**kwargs)
         self.encoder = encoder
         self.decoder = decoder
-        self.decoder_softmax = decoder_softmax
         self.unet = unet
         self.num_timesteps = num_timesteps
-        self.num_classes = num_classes
-
-        self.betas = tf.linspace(beta_start, beta_end, num_timesteps)
+        self.betas = tf.cast(tf.linspace(beta_start, beta_end, num_timesteps), tf.float32)
         self.alphas = 1. - self.betas
         self.alphas_cumprod = tf.math.cumprod(self.alphas, axis=0)
         self.sqrt_alphas_cumprod = tf.sqrt(self.alphas_cumprod)
@@ -431,10 +576,9 @@ class DiffusionModel(keras.Model):
         self.sqrt_recip_alphas = tf.sqrt(1.0 / self.alphas)
         alphas_cumprod_prev = tf.concat([[1.0], self.alphas_cumprod[:-1]], axis=0)
         self.posterior_variance = self.betas * (1. - alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-
-        self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
-        self.diffusion_loss_tracker = keras.metrics.Mean(name="diffusion_loss")
-        self.reconstruction_loss_tracker = keras.metrics.Mean(name="reconstruction_loss")
+        self.total_loss_tracker = keras.metrics.Mean(name="total_loss", dtype=tf.float32)
+        self.diffusion_loss_tracker = keras.metrics.Mean(name="diffusion_loss", dtype=tf.float32)
+        self.reconstruction_loss_tracker = keras.metrics.Mean(name="reconstruction_loss", dtype=tf.float32)
 
     @property
     def metrics(self):
@@ -458,7 +602,7 @@ class DiffusionModel(keras.Model):
 
     def q_sample(self, x_start, t, noise=None):
         if noise is None:
-            noise = tf.random.normal(tf.shape(x_start))
+            noise = tf.random.normal(tf.shape(x_start), dtype=tf.float32)
         sqrt_alphas_cumprod_t = tf.gather(self.sqrt_alphas_cumprod, t)
         sqrt_one_minus_alphas_cumprod_t = tf.gather(self.sqrt_one_minus_alphas_cumprod, t)
         sqrt_alphas_cumprod_t = tf.reshape(sqrt_alphas_cumprod_t, [-1] + [1] * (len(x_start.shape) - 1))
@@ -481,53 +625,45 @@ class DiffusionModel(keras.Model):
         else:
             posterior_variance_t = tf.gather(self.posterior_variance, t)
             posterior_variance_t = tf.reshape(posterior_variance_t, [-1] + [1] * (len(x.shape) - 1))
-            noise = tf.random.normal(shape=tf.shape(x))
+            noise = tf.random.normal(shape=tf.shape(x), dtype=tf.float32)
             return model_mean + tf.sqrt(posterior_variance_t) * noise
 
     def sample(self, num_samples, training=False):
-        print(f"\nGenerating {num_samples} discrete samples...")
-        x = tf.random.normal((num_samples, latent_dim))
+        print(f"\nGenerating {num_samples} samples...")
+        x = tf.random.normal((num_samples, latent_dim), dtype=tf.float32)
         for i in range(self.num_timesteps - 1, -1, -1):
             t = tf.ones((num_samples,), dtype=tf.int32) * i
             x = self.p_sample(x, t, i)
             if i % 100 == 0 or i < 10:
                 print(f"  Timestep {i + 1}/{self.num_timesteps}")
-        print("Decoding latents to softmax probabilities...")
-        softmax_output = self.decoder_softmax(x, training=training)
-        discrete_output = tf.argmax(softmax_output, axis=-1)
-        generated_images = tf.cast(discrete_output, tf.float32) - 1.0
-        generated_images = tf.expand_dims(generated_images, axis=-1)
+        print("Decoding latents to images...")
+        generated_images = self.decoder(x, training=training)
         if isinstance(generated_images, tf.Tensor):
             generated_images = generated_images.numpy()
-        print(f"Sample generation complete.")
-        print(f"Unique values in generated samples: {np.unique(generated_images)}")
+        generated_images = np.clip(generated_images, -1.0, 1.0)
+        img_mean = np.mean(np.abs(generated_images))
+        print(f"Sample generation complete. Mean absolute value: {img_mean:.4f}")
+        print(f"Range: [{generated_images.min():.3f}, {generated_images.max():.3f}]")
         return generated_images
 
     def train_step(self, data):
         if isinstance(data, tuple):
-            images = data[0]
+            images = tf.cast(data[0], tf.float32)
         else:
-            images = data
+            images = tf.cast(data, tf.float32)
         batch_size = tf.shape(images)[0]
         with tf.GradientTape() as tape:
             latents = self.encoder(images, training=True)
             t = self.sample_timesteps(batch_size)
-            noise = tf.random.normal(tf.shape(latents))
+            noise = tf.random.normal(tf.shape(latents), dtype=tf.float32)
             noisy_latents = self.q_sample(latents, t, noise)
             t_reshaped = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
             pred_noise = self.unet([noisy_latents, t_reshaped], training=True)
             diffusion_loss = tf.reduce_mean(tf.square(pred_noise - noise))
             reconstructed = self.decoder(latents, training=True)
+            reconstructed = tf.cast(reconstructed, tf.float32)
             reconstruction_loss = tf.reduce_mean(tf.square(images - reconstructed))
-            reconstructed_softmax = self.decoder_softmax(latents, training=True)
-            target_classes = tf.cast((images + 1) / 2 * (self.num_classes - 1), tf.int32)
-            target_classes = tf.squeeze(target_classes, axis=-1)
-            classification_loss = tf.reduce_mean(
-                tf.keras.losses.sparse_categorical_crossentropy(
-                    target_classes, reconstructed_softmax, from_logits=False
-                )
-            )
-            total_loss = diffusion_loss + beta * reconstruction_loss + 0.1 * classification_loss
+            total_loss = diffusion_loss + beta * reconstruction_loss
         trainable_vars = self.trainable_variables
         gradients = tape.gradient(total_loss, trainable_vars)
         gradients = [tf.clip_by_norm(g, 1.0) for g in gradients if g is not None]
@@ -543,28 +679,21 @@ class DiffusionModel(keras.Model):
 
     def test_step(self, data):
         if isinstance(data, tuple):
-            images = data[0]
+            images = tf.cast(data[0], tf.float32)
         else:
-            images = data
+            images = tf.cast(data, tf.float32)
         batch_size = tf.shape(images)[0]
         latents = self.encoder(images, training=False)
         t = self.sample_timesteps(batch_size)
-        noise = tf.random.normal(tf.shape(latents))
+        noise = tf.random.normal(tf.shape(latents), dtype=tf.float32)
         noisy_latents = self.q_sample(latents, t, noise)
         t_reshaped = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
         pred_noise = self.unet([noisy_latents, t_reshaped], training=False)
         diffusion_loss = tf.reduce_mean(tf.square(pred_noise - noise))
         reconstructed = self.decoder(latents, training=False)
+        reconstructed = tf.cast(reconstructed, tf.float32)
         reconstruction_loss = tf.reduce_mean(tf.square(images - reconstructed))
-        reconstructed_softmax = self.decoder_softmax(latents, training=False)
-        target_classes = tf.cast((images + 1) / 2 * (self.num_classes - 1), tf.int32)
-        target_classes = tf.squeeze(target_classes, axis=-1)
-        classification_loss = tf.reduce_mean(
-            tf.keras.losses.sparse_categorical_crossentropy(
-                target_classes, reconstructed_softmax, from_logits=False
-            )
-        )
-        total_loss = diffusion_loss + beta * reconstruction_loss + 0.1 * classification_loss
+        total_loss = diffusion_loss + beta * reconstruction_loss
         self.total_loss_tracker.update_state(total_loss)
         self.diffusion_loss_tracker.update_state(diffusion_loss)
         self.reconstruction_loss_tracker.update_state(reconstruction_loss)
@@ -576,9 +705,9 @@ class DiffusionModel(keras.Model):
 
     def call(self, inputs):
         if isinstance(inputs, tuple):
-            images = inputs[0]
+            images = tf.cast(inputs[0], tf.float32)
         else:
-            images = inputs
+            images = tf.cast(inputs, tf.float32)
         latents = self.encoder(images)
         batch_size = tf.shape(images)[0]
         timesteps = tf.random.uniform(
@@ -589,15 +718,15 @@ class DiffusionModel(keras.Model):
         return pred_noise
 
 
-# Initialize model
+# Initialize diffusion model
 diffusion_model = DiffusionModel(
-    encoder, decoder, decoder_softmax, unet,
+    encoder, decoder, unet,
     num_timesteps=num_timesteps,
     beta_start=beta_start,
     beta_end=beta_end
 )
 
-dummy_input = tf.random.normal((1, ni, nj, nz))
+dummy_input = tf.random.normal((1, ni, nj, nz), dtype=tf.float32)
 _ = diffusion_model(dummy_input)
 diffusion_model.compile()
 
@@ -608,9 +737,28 @@ unet.summary()
 print("=" * 60 + "\n")
 
 
-# ==============================================
-# PLOTTING FUNCTIONS
-# ==============================================
+def lr_scheduler(epoch):
+    decay_rate = 0.95
+    decay_step = 50
+    if epoch > 0 and epoch % decay_step == 0:
+        return initial_lr * (decay_rate ** (epoch // decay_step))
+    return initial_lr
+
+
+def perceptual_loss(real_images, fake_images):
+    real_images_resized = tf.image.resize(real_images, [75, 75])
+    fake_images_resized = tf.image.resize(fake_images, [75, 75])
+    if real_images.shape[-1] == 1:
+        real_images_resized = tf.repeat(real_images_resized, 3, axis=-1)
+        fake_images_resized = tf.repeat(fake_images_resized, 3, axis=-1)
+    real_features_iv3 = f_extraction_iv3(real_images_resized)
+    fake_features_iv3 = f_extraction_iv3(fake_images_resized)
+    real_features_rc = f_extraction_rc(real_images)
+    fake_features_rc = f_extraction_rc(fake_images)
+    loss_iv3 = tf.reduce_mean(tf.square(real_features_iv3 - fake_features_iv3))
+    loss_rc = tf.reduce_mean(tf.square(real_features_rc - fake_features_rc))
+    return loss_iv3 + loss_rc
+
 
 def plot_histograms_and_densities(original, reconstructed, latent, epoch=None, save_interval=10):
     figsize = (24 * HIGH_RES_CONFIG['figsize_multiplier'],
@@ -741,10 +889,7 @@ class DistributionPlotCallback(tf.keras.callbacks.Callback):
             sample_idx = np.random.randint(0, len(self.test_data), 1)
             test_samples = self.test_data[sample_idx]
             latents = self.model.encoder.predict(test_samples, verbose=0)
-            softmax_output = self.model.decoder_softmax.predict(latents, verbose=0)
-            discrete_output = np.argmax(softmax_output, axis=-1)
-            reconstructions = discrete_output.astype(float) - 1.0
-            reconstructions = np.expand_dims(reconstructions, axis=-1)
+            reconstructions = self.model.decoder.predict(latents, verbose=0)
             latent_samples = analyze_latent_space(self.model.encoder, self.test_data)
             saved_files = plot_histograms_and_densities(
                 test_samples, reconstructions, latent_samples,
@@ -777,17 +922,13 @@ class LivePlotCallback(keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
         indices = np.random.randint(0, self.data.shape[0], self.num_images)
         original_imgs = self.data[indices]
-        latents = self.model.encoder.predict(original_imgs, verbose=0)
-        softmax_output = self.model.decoder_softmax.predict(latents, verbose=0)
-        discrete_output = np.argmax(softmax_output, axis=-1)
-        reconstructed_imgs = discrete_output.astype(float) - 1.0
-        reconstructed_imgs = np.expand_dims(reconstructed_imgs, axis=-1)
+        latents = self.model.encoder.predict(original_imgs)
+        reconstructed_imgs = self.model.decoder.predict(latents)
         for i in range(self.num_images):
-            self.ax[i * 2].imshow(original_imgs[i].squeeze(), cmap='viridis', interpolation='nearest', vmin=-1, vmax=1)
+            self.ax[i * 2].imshow(original_imgs[i].squeeze(), cmap='viridis', interpolation='nearest')
             self.ax[i * 2].set_title("Original", fontweight='bold', fontsize=8)
             self.ax[i * 2].axis('off')
-            self.ax[i * 2 + 1].imshow(reconstructed_imgs[i].squeeze(), cmap='viridis', interpolation='nearest', vmin=-1,
-                                      vmax=1)
+            self.ax[i * 2 + 1].imshow(reconstructed_imgs[i].squeeze(), cmap='viridis', interpolation='nearest')
             self.ax[i * 2 + 1].set_title(f"Reconstructed", fontweight='bold', fontsize=8)
             self.ax[i * 2 + 1].axis('off')
         self.fig.suptitle(f'Latent Diffusion - Epoch {epoch + 1}: Original vs Reconstructed Samples',
@@ -836,6 +977,7 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             if isinstance(fake_data, tf.Tensor):
                 fake_data = fake_data.numpy()
             if np.any(np.isnan(fake_data)):
+                print(f"Warning: Generated data contains NaN values")
                 fake_data = np.nan_to_num(fake_data, nan=0.0)
             static_results = self.compute_static_metrics_corrected(self.x_test[:size], fake_data[:size])
             training_metrics = {
@@ -843,8 +985,6 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                 'diffusion_loss': logs.get('diffusion_loss', 0),
                 'recon_loss': logs.get('reconstruction_loss', 0)
             }
-
-            # -------- FID/FRD/KID/KRD (real computation) --------
             try:
                 from metrics import frechet_distance, kernel_distance
                 real_resized = tf.image.resize(np.repeat(self.x_test[:size], 3, axis=3), [75, 75])
@@ -855,10 +995,8 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                 act_gen_rc = f_extraction_rc.predict(fake_data, verbose=0)
                 fid_500 = frechet_distance(act_train_iv3[:500], act_gen_iv3[:500])
                 frd_500 = frechet_distance(act_train_rc[:500], act_gen_rc[:500])
-                kid_500 = kernel_distance(act_train_iv3[:500], act_gen_iv3[:500],
-                                          num_blocks=50, max_block_size=500)
-                krd_500 = kernel_distance(act_train_rc[:500], act_gen_rc[:500],
-                                          num_blocks=50, max_block_size=500)
+                kid_500 = kernel_distance(act_train_iv3[:500], act_gen_iv3[:500], num_blocks=50, max_block_size=500)
+                krd_500 = kernel_distance(act_train_rc[:500], act_gen_rc[:500], num_blocks=50, max_block_size=500)
                 traditional_results = {
                     'FID_500': fid_500, 'FRD_500': frd_500,
                     'KID_500': kid_500, 'KRD_500': krd_500
@@ -869,7 +1007,6 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                     'FID_500': 0, 'FRD_500': 0,
                     'KID_500': 0, 'KRD_500': 0
                 }
-
             for key in ['FID_500', 'FRD_500', 'KID_500', 'KRD_500']:
                 self.metrics[key].append(traditional_results[key])
             for key in self.static_metrics:
@@ -884,34 +1021,9 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
         n_samples = min(500, len(real_data), len(fake_data))
         real_subset = real_data[:n_samples]
         fake_subset = fake_data[:n_samples]
-        metrics = {}
-        lags, variogram_real = StaticMetrics.variogram_2d_optimized(real_subset[:100], max_lag=25)
-        _, variogram_fake = StaticMetrics.variogram_2d_optimized(fake_subset[:100], max_lag=25)
-        metrics['variogram_mse'] = np.mean((variogram_real - variogram_fake) ** 2)
-        _, connectivity_real = StaticMetrics.connectivity_function(real_subset[:100], 0.5, lag_distances=lags)
-        _, connectivity_fake = StaticMetrics.connectivity_function(fake_subset[:100], 0.5, lag_distances=lags)
-        metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
-        real_flat = real_subset.flatten()
-        fake_flat = fake_subset.flatten()
-        n_bins = min(100, len(real_flat) // 10)
-        hist_real, bin_edges = np.histogram(real_flat, bins=n_bins, density=True)
-        hist_fake, _ = np.histogram(fake_flat, bins=n_bins, range=(bin_edges[0], bin_edges[-1]), density=True)
-        epsilon = 1e-10
-        hist_real = np.maximum(hist_real, epsilon)
-        hist_fake = np.maximum(hist_fake, epsilon)
-        hist_real = hist_real / np.sum(hist_real)
-        hist_fake = hist_fake / np.sum(hist_fake)
-        m = (hist_real + hist_fake) / 2
-        metrics['hist_kl'] = 0.5 * np.sum(hist_real * np.log(hist_real / m)) + \
-                             0.5 * np.sum(hist_fake * np.log(hist_fake / m))
-        pca_real, _ = StaticMetrics.calculate_pca_features(real_subset[:500])
-        pca_fake, _ = StaticMetrics.calculate_pca_features(fake_subset[:500])
-        if pca_real.shape[0] == pca_fake.shape[0] and pca_real.shape[1] > 0:
-            corr = np.corrcoef(pca_real[:, 0], pca_fake[:, 0])[0, 1]
-            metrics['pca_correlation'] = corr
-        else:
-            metrics['pca_correlation'] = 0.0
-        metrics['mds_mmd'] = 0.0
+        metrics = self.compute_all_metrics_corrected(
+            real_subset, fake_subset, threshold=0.5, max_lag=25
+        )
         return {
             'Variogram_MSE': metrics['variogram_mse'],
             'Connectivity_MSE': metrics['connectivity_mse'],
@@ -919,6 +1031,77 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             'PCA_Correlation': metrics['pca_correlation'],
             'MDS_MMD': metrics['mds_mmd']
         }
+
+    def compute_all_metrics_corrected(self, real_data, fake_data, threshold=0.5, max_lag=25):
+        metrics = {}
+        print("Calculating variograms...")
+        lags, variogram_real = StaticMetrics.variogram_2d_optimized(real_data[:100], max_lag=max_lag)
+        _, variogram_fake = StaticMetrics.variogram_2d_optimized(fake_data[:100], max_lag=max_lag)
+        metrics['variogram_lags'] = lags
+        metrics['variogram_real'] = variogram_real
+        metrics['variogram_fake'] = variogram_fake
+        metrics['variogram_mse'] = np.mean((variogram_real - variogram_fake) ** 2)
+        print("Calculating connectivity functions...")
+        _, connectivity_real = StaticMetrics.connectivity_function(
+            real_data[:100], threshold, lag_distances=lags
+        )
+        _, connectivity_fake = StaticMetrics.connectivity_function(
+            fake_data[:100], threshold, lag_distances=lags
+        )
+        metrics['connectivity_real'] = connectivity_real
+        metrics['connectivity_fake'] = connectivity_fake
+        metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
+        print("Calculating PCA...")
+        pca_real, var_ratio_real = StaticMetrics.calculate_pca_features(real_data[:500])
+        pca_fake, var_ratio_fake = StaticMetrics.calculate_pca_features(fake_data[:500])
+        if pca_real.shape[0] == pca_fake.shape[0]:
+            n_components = min(2, pca_real.shape[1], pca_fake.shape[1])
+            pca_correlations = []
+            for i in range(n_components):
+                corr = np.corrcoef(pca_real[:, i], pca_fake[:, i])[0, 1]
+                pca_correlations.append(corr)
+            metrics['pca_correlation'] = np.mean(pca_correlations)
+        else:
+            metrics['pca_correlation'] = 0.0
+        metrics['pca_real'] = pca_real[:, :2]
+        metrics['pca_fake'] = pca_fake[:, :2]
+        metrics['pca_var_ratio_real'] = var_ratio_real
+        metrics['pca_var_ratio_fake'] = var_ratio_fake
+        print("Calculating MDS...")
+        mds_real = StaticMetrics.calculate_mds_features(real_data[:500])
+        mds_fake = StaticMetrics.calculate_mds_features(fake_data[:500])
+        from sklearn.metrics.pairwise import rbf_kernel
+        n_samples = min(len(mds_real), len(mds_fake), 100)
+        mds_real_small = mds_real[:n_samples]
+        mds_fake_small = mds_fake[:n_samples]
+        if len(mds_real_small) > 0 and len(mds_fake_small) > 0:
+            X = np.vstack([mds_real_small, mds_fake_small])
+            pairwise_dists = pdist(X)
+            gamma = 1.0 / (2.0 * np.median(pairwise_dists) ** 2) if len(pairwise_dists) > 0 else 1.0
+            K_XX = rbf_kernel(mds_real_small, mds_real_small, gamma=gamma)
+            K_YY = rbf_kernel(mds_fake_small, mds_fake_small, gamma=gamma)
+            K_XY = rbf_kernel(mds_real_small, mds_fake_small, gamma=gamma)
+            mmd_squared = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
+            metrics['mds_mmd'] = np.sqrt(max(mmd_squared, 0))
+        else:
+            metrics['mds_mmd'] = 0.0
+        metrics['mds_real'] = mds_real
+        metrics['mds_fake'] = mds_fake
+        print("Calculating histogram statistics (CORRECTED)...")
+        real_flat = real_data.flatten()
+        fake_flat = fake_data.flatten()
+        all_data = np.concatenate([real_flat, fake_flat])
+        data_min, data_max = np.min(all_data), np.max(all_data)
+        hist_real, bin_edges = np.histogram(real_flat, bins=100, range=(data_min, data_max), density=False)
+        hist_fake, _ = np.histogram(fake_flat, bins=100, range=(data_min, data_max), density=False)
+        hist_real = hist_real.astype(float) / np.sum(hist_real)
+        hist_fake = hist_fake.astype(float) / np.sum(hist_fake)
+        epsilon = 1e-10
+        hist_real = np.clip(hist_real, epsilon, 1)
+        hist_fake = np.clip(hist_fake, epsilon, 1)
+        kl_divergence = np.sum(hist_real * np.log(hist_real / hist_fake))
+        metrics['hist_kl'] = kl_divergence
+        return metrics
 
     def plot_static_metrics(self, epoch, static_metrics, save_interval=10):
         should_save = ((epoch % save_interval == 0) or (epoch == epochs))
@@ -933,6 +1116,7 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
         axes[0, 0].set_ylabel('Metric Value', fontweight='bold', fontsize=22)
         axes[0, 0].set_title(f'Static Metrics - Epoch {epoch}', fontweight='bold', fontsize=24)
         axes[0, 0].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+        axes[0, 0].tick_params(axis='both', which='major', labelsize=18, width=2)
         static_metrics_list = list(self.static_metrics.items())
         for i, (metric_name, values) in enumerate(static_metrics_list):
             if values:
@@ -944,11 +1128,13 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                     row, col = 2, 1
                 if row < axes.shape[0] and col < axes.shape[1]:
                     axes[row, col].plot(range(len(values)), values, marker='o',
-                                        linewidth=HIGH_RES_CONFIG['line_width'])
+                                        linewidth=HIGH_RES_CONFIG['line_width'],
+                                        markersize=HIGH_RES_CONFIG['marker_size'] // 10)
                     axes[row, col].set_xlabel('Epoch', fontweight='bold', fontsize=22)
                     axes[row, col].set_ylabel(metric_name, fontweight='bold', fontsize=22)
                     axes[row, col].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
                     axes[row, col].set_title(f'{metric_name} Trend', fontweight='bold', fontsize=24)
+                    axes[row, col].tick_params(axis='both', which='major', labelsize=18, width=2)
         plt.tight_layout()
         if should_save:
             base_filename = f"training_outputs/latent_diffusion_static_metrics_epoch_{epoch:03d}"
@@ -957,6 +1143,7 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
         else:
             plt.pause(0.01)
             saved_files = []
+            print(f"Displayed static metrics at epoch {epoch} (not saved)")
         plt.close(fig)
         return saved_files
 
@@ -975,6 +1162,33 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                     f"{static_metrics['Histogram_KL']:.4f}\t"
                     f"{static_metrics['PCA_Correlation']:.4f}\t"
                     f"{static_metrics['MDS_MMD']:.4f}\n")
+        csv_file = self.log_file.replace('.txt', '.csv')
+        if epoch == self.metric_interval:
+            df_columns = [
+                'Epoch', 'Total_Loss', 'Diffusion_Loss', 'Recon_Loss',
+                'FID_500', 'FRD_500', 'KID_500', 'KRD_500',
+                'Variogram_MSE', 'Connectivity_MSE', 'Histogram_KL',
+                'PCA_Correlation', 'MDS_MMD'
+            ]
+            pd.DataFrame(columns=df_columns).to_csv(csv_file, index=False)
+        metrics_row = {
+            'Epoch': epoch,
+            'Total_Loss': training_metrics['total_loss'],
+            'Diffusion_Loss': training_metrics['diffusion_loss'],
+            'Recon_Loss': training_metrics['recon_loss'],
+            'FID_500': traditional_metrics['FID_500'],
+            'FRD_500': traditional_metrics['FRD_500'],
+            'KID_500': traditional_metrics['KID_500'],
+            'KRD_500': traditional_metrics['KRD_500'],
+            'Variogram_MSE': static_metrics['Variogram_MSE'],
+            'Connectivity_MSE': static_metrics['Connectivity_MSE'],
+            'Histogram_KL': static_metrics['Histogram_KL'],
+            'PCA_Correlation': static_metrics['PCA_Correlation'],
+            'MDS_MMD': static_metrics['MDS_MMD']
+        }
+        df = pd.DataFrame([metrics_row])
+        df.to_csv(csv_file, mode='a', header=False, index=False)
+        print(f"Metrics saved to CSV: {csv_file}")
 
     def display_metrics(self, epoch, training_metrics, traditional_metrics, static_metrics):
         output = (
@@ -989,10 +1203,10 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             f"  FRD(500): {traditional_metrics['FRD_500']:.2f}\n"
             f"  KID(500): {traditional_metrics['KID_500']:.4f}\n"
             f"  KRD(500): {traditional_metrics['KRD_500']:.4f}\n\n"
-            f"Static Geostatistical Metrics:\n"
+            f"Static Geostatistical Metrics (CORRECTED):\n"
             f"  Variogram MSE: {static_metrics['Variogram_MSE']:.4f}\n"
             f"  Connectivity MSE: {static_metrics['Connectivity_MSE']:.4f}\n"
-            f"  Histogram JS: {static_metrics['Histogram_KL']:.4f}\n"
+            f"  Histogram KL: {static_metrics['Histogram_KL']:.4f}\n"
             f"  PCA Correlation: {static_metrics['PCA_Correlation']:.4f}\n"
             f"  MDS MMD: {static_metrics['MDS_MMD']:.4f}\n"
             f"{'=' * 40}"
@@ -1007,6 +1221,23 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
         for key, values in self.static_metrics.items():
             if values:
                 np.save(f'training_outputs/latent_diffusion_{key}.npy', values)
+        self.save_comprehensive_csv()
+
+    def save_comprehensive_csv(self):
+        all_metrics = {}
+        for key, values in self.metrics.items():
+            if values:
+                all_metrics[key] = values
+        for key, values in self.static_metrics.items():
+            if values:
+                all_metrics[key] = values
+        df = pd.DataFrame(all_metrics)
+        if not df.empty:
+            df.index = [(i + 1) * self.metric_interval for i in range(len(df))]
+            df.index.name = 'Epoch'
+            csv_path = 'training_outputs/latent_diffusion_all_metrics.csv'
+            df.to_csv(csv_path)
+            print(f"Comprehensive metrics saved to CSV: {csv_path}")
 
 
 class LossHistoryCallback(tf.keras.callbacks.Callback):
@@ -1028,6 +1259,85 @@ class LossHistoryCallback(tf.keras.callbacks.Callback):
         self.val_recon_losses.append(logs.get('val_reconstruction_loss', 0))
 
 
+def plot_losses(loss_history, save_prefix="latent_diffusion", save_interval=10, total_epochs=epochs):
+    figsize = (22 * HIGH_RES_CONFIG['figsize_multiplier'],
+               14 * HIGH_RES_CONFIG['figsize_multiplier'])
+    fig = plt.figure(figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
+    plt.rcParams.update({
+        'font.size': 20,
+        'axes.titlesize': 24,
+        'axes.labelsize': 22,
+        'xtick.labelsize': 18,
+        'ytick.labelsize': 18,
+        'legend.fontsize': 18
+    })
+    epochs_range = range(1, len(loss_history.total_losses) + 1)
+    plt.subplot(2, 2, 1)
+    plt.plot(epochs_range, loss_history.total_losses, label='Training Total Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
+    plt.plot(epochs_range, loss_history.val_total_losses, label='Validation Total Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
+    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
+    plt.ylabel('Loss', fontweight='bold', fontsize=22)
+    plt.title('Total Loss', fontweight='bold', fontsize=24)
+    plt.legend(fontsize=18)
+    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
+    plt.subplot(2, 2, 2)
+    plt.plot(epochs_range, loss_history.diffusion_losses, label='Training Diffusion Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
+    plt.plot(epochs_range, loss_history.val_diffusion_losses, label='Validation Diffusion Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
+    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
+    plt.ylabel('Loss', fontweight='bold', fontsize=22)
+    plt.title('Diffusion Loss', fontweight='bold', fontsize=24)
+    plt.legend(fontsize=18)
+    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
+    plt.subplot(2, 2, 3)
+    plt.plot(epochs_range, loss_history.recon_losses, label='Training Recon Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
+    plt.plot(epochs_range, loss_history.val_recon_losses, label='Validation Recon Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
+    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
+    plt.ylabel('Loss', fontweight='bold', fontsize=22)
+    plt.title('Reconstruction Loss', fontweight='bold', fontsize=24)
+    plt.legend(fontsize=18)
+    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
+    plt.suptitle('Latent Diffusion Training Losses', fontsize=26, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    base_filename = f"training_outputs/{save_prefix}_all_losses"
+    saved_files = save_figure_multiple_formats(fig, base_filename, HIGH_RES_CONFIG['dpi'])
+    plt.close(fig)
+    plot_individual_losses(loss_history, save_prefix)
+    return saved_files
+
+
+def plot_individual_losses(loss_history, save_prefix="latent_diffusion"):
+    epochs_range = range(1, len(loss_history.total_losses) + 1)
+    loss_types = [
+        ('total_loss', loss_history.total_losses, loss_history.val_total_losses, 'Total Loss'),
+        ('diffusion_loss', loss_history.diffusion_losses, loss_history.val_diffusion_losses, 'Diffusion Loss'),
+        ('recon_loss', loss_history.recon_losses, loss_history.val_recon_losses, 'Reconstruction Loss')
+    ]
+    for loss_name, train_loss, val_loss, title in loss_types:
+        fig, ax = plt.subplots(figsize=(12 * HIGH_RES_CONFIG['figsize_multiplier'],
+                                        8 * HIGH_RES_CONFIG['figsize_multiplier']),
+                               dpi=HIGH_RES_CONFIG['dpi'])
+        ax.plot(epochs_range, train_loss, label='Training', linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
+        ax.plot(epochs_range, val_loss, label='Validation', linewidth=HIGH_RES_CONFIG['line_width'], color='red')
+        ax.set_xlabel('Epochs', fontweight='bold', fontsize=22)
+        ax.set_ylabel('Loss', fontweight='bold', fontsize=22)
+        ax.set_title(f'Latent Diffusion: {title}', fontsize=24, fontweight='bold')
+        ax.legend(fontsize=18)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+        ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+        base_filename = f"training_outputs/{save_prefix}_{loss_name}"
+        saved_files = save_figure_multiple_formats(fig, base_filename, HIGH_RES_CONFIG['dpi'])
+        plt.close(fig)
+
+
 def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=None):
     n_samples = min(500, len(real_data))
     fake_data = diffusion_model.sample(n_samples, training=False)
@@ -1045,27 +1355,32 @@ def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=No
     metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
     real_flat = real_data.flatten()
     fake_flat = fake_data.flatten()
-    n_bins = min(100, len(real_flat) // 10)
-    hist_real, bin_edges = np.histogram(real_flat, bins=n_bins, density=True)
-    hist_fake, _ = np.histogram(fake_flat, bins=n_bins, range=(bin_edges[0], bin_edges[-1]), density=True)
+    all_data = np.concatenate([real_flat, fake_flat])
+    data_min, data_max = np.min(all_data), np.max(all_data)
+    hist_real, bin_edges = np.histogram(real_flat, bins=100, range=(data_min, data_max), density=False)
+    hist_fake, _ = np.histogram(fake_flat, bins=100, range=(data_min, data_max), density=False)
+    hist_real = hist_real.astype(float) / np.sum(hist_real)
+    hist_fake = hist_fake.astype(float) / np.sum(hist_fake)
     epsilon = 1e-10
-    hist_real = np.maximum(hist_real, epsilon) / np.sum(np.maximum(hist_real, epsilon))
-    hist_fake = np.maximum(hist_fake, epsilon) / np.sum(np.maximum(hist_fake, epsilon))
-    m = (hist_real + hist_fake) / 2
-    metrics['hist_kl'] = 0.5 * np.sum(hist_real * np.log(hist_real / m)) + \
-                         0.5 * np.sum(hist_fake * np.log(hist_fake / m))
+    hist_real = np.clip(hist_real, epsilon, 1)
+    hist_fake = np.clip(hist_fake, epsilon, 1)
+    metrics['hist_kl'] = np.sum(hist_real * np.log(hist_real / hist_fake))
     pca_real, _ = StaticMetrics.calculate_pca_features(real_data[:500])
     pca_fake, _ = StaticMetrics.calculate_pca_features(fake_data[:500])
-    if pca_real.shape[0] == pca_fake.shape[0] and pca_real.shape[1] > 0:
-        corr = np.corrcoef(pca_real[:, 0], pca_fake[:, 0])[0, 1]
-        metrics['pca_correlation'] = corr
+    if pca_real.shape[0] == pca_fake.shape[0]:
+        n_components = min(2, pca_real.shape[1], pca_fake.shape[1])
+        pca_correlations = []
+        for i in range(n_components):
+            corr = np.corrcoef(pca_real[:, i], pca_fake[:, i])[0, 1]
+            pca_correlations.append(corr)
+        metrics['pca_correlation'] = np.mean(pca_correlations)
     else:
         metrics['pca_correlation'] = 0.0
     mds_real = StaticMetrics.calculate_mds_features(real_data[:500])
     mds_fake = StaticMetrics.calculate_mds_features(fake_data[:500])
-    n_samples_mds = min(len(mds_real), len(mds_fake), 100)
-    mds_real_small = mds_real[:n_samples_mds]
-    mds_fake_small = mds_fake[:n_samples_mds]
+    n_samples = min(len(mds_real), len(mds_fake), 100)
+    mds_real_small = mds_real[:n_samples]
+    mds_fake_small = mds_fake[:n_samples]
     if len(mds_real_small) > 0 and len(mds_fake_small) > 0:
         X = np.vstack([mds_real_small, mds_fake_small])
         pairwise_dists = pdist(X)
@@ -1080,67 +1395,105 @@ def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=No
     figsize = (22 * HIGH_RES_CONFIG['figsize_multiplier'],
                14 * HIGH_RES_CONFIG['figsize_multiplier'])
     fig, axes = plt.subplots(2, 3, figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
-    fig.suptitle('Latent Diffusion: Static Geostatistical Metrics Comparison',
+    fig.suptitle('Latent Diffusion: Static Geostatistical Metrics Comparison (CORRECTED)',
                  fontsize=26, fontweight='bold', y=1.02)
-    axes[0, 0].plot(lags, variogram_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
-    axes[0, 0].plot(lags, variogram_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-    axes[0, 0].set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
-    axes[0, 0].set_ylabel('Variogram', fontweight='bold', fontsize=22)
-    axes[0, 0].set_title(f'Variogram (MSE: {metrics["variogram_mse"]:.4f})', fontweight='bold', fontsize=24)
-    axes[0, 0].legend(fontsize=18)
-    axes[0, 0].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    axes[0, 1].plot(lags, connectivity_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
-    axes[0, 1].plot(lags, connectivity_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-    axes[0, 1].set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
-    axes[0, 1].set_ylabel('Connectivity', fontweight='bold', fontsize=22)
-    axes[0, 1].set_title(f'Connectivity (MSE: {metrics["connectivity_mse"]:.4f})', fontweight='bold', fontsize=24)
-    axes[0, 1].legend(fontsize=18)
-    axes[0, 1].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    for ax in axes.flat:
+        ax.tick_params(labelsize=18, width=1.5)
+        ax.xaxis.label.set_size(22)
+        ax.yaxis.label.set_size(22)
+        ax.title.set_size(24)
+    ax = axes[0, 0]
+    ax.plot(lags, variogram_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
+    ax.plot(lags, variogram_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+    ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
+    ax.set_ylabel('Variogram', fontweight='bold', fontsize=22)
+    ax.set_title(f'Variogram (MSE: {metrics["variogram_mse"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[0, 1]
+    ax.plot(lags, connectivity_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
+    ax.plot(lags, connectivity_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+    ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
+    ax.set_ylabel('Connectivity', fontweight='bold', fontsize=22)
+    ax.set_title(f'Connectivity Function (MSE: {metrics["connectivity_mse"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[0, 2]
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     bar_width = bin_centers[1] - bin_centers[0]
-    axes[0, 2].bar(bin_centers, hist_real, width=bar_width, alpha=0.6, label='Real', color='blue')
-    axes[0, 2].plot(bin_centers, hist_fake, 'r-', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-    axes[0, 2].set_xlabel('Value', fontweight='bold', fontsize=22)
-    axes[0, 2].set_ylabel('Density', fontweight='bold', fontsize=22)
-    axes[0, 2].set_title(f'Histogram (JS: {metrics["hist_kl"]:.4f})', fontweight='bold', fontsize=24)
-    axes[0, 2].legend(fontsize=18)
-    axes[0, 2].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    axes[1, 0].scatter(pca_real[:100, 0], pca_real[:100, 1], alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
-                       color='blue')
-    axes[1, 0].scatter(pca_fake[:100, 0], pca_fake[:100, 1], alpha=0.6, label='Generated',
-                       s=HIGH_RES_CONFIG['marker_size'], color='red')
-    axes[1, 0].set_xlabel('PC1', fontweight='bold', fontsize=22)
-    axes[1, 0].set_ylabel('PC2', fontweight='bold', fontsize=22)
-    axes[1, 0].set_title(f'PCA (Corr: {metrics["pca_correlation"]:.4f})', fontweight='bold', fontsize=24)
-    axes[1, 0].legend(fontsize=18)
-    axes[1, 0].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    axes[1, 1].scatter(mds_real[:100, 0], mds_real[:100, 1], alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
-                       color='blue')
-    axes[1, 1].scatter(mds_fake[:100, 0], mds_fake[:100, 1], alpha=0.6, label='Generated',
-                       s=HIGH_RES_CONFIG['marker_size'], color='red')
-    axes[1, 1].set_xlabel('MDS 1', fontweight='bold', fontsize=22)
-    axes[1, 1].set_ylabel('MDS 2', fontweight='bold', fontsize=22)
-    axes[1, 1].set_title(f'MDS (MMD: {metrics["mds_mmd"]:.4f})', fontweight='bold', fontsize=24)
-    axes[1, 1].legend(fontsize=18)
-    axes[1, 1].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.bar(bin_centers, hist_real, width=bar_width, alpha=0.6, label='Real', color='blue', edgecolor='black',
+           linewidth=1.0)
+    ax.plot(bin_centers, hist_fake, 'r-', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+    ax.set_xlabel('Value', fontweight='bold', fontsize=22)
+    ax.set_ylabel('Density', fontweight='bold', fontsize=22)
+    ax.set_title(f'Histogram (KL: {metrics["hist_kl"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[1, 0]
+    ax.scatter(pca_real[:100, 0], pca_real[:100, 1], alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
+               color='blue', edgecolor='black', linewidth=1.0)
+    ax.scatter(pca_fake[:100, 0], pca_fake[:100, 1], alpha=0.6, label='Generated', s=HIGH_RES_CONFIG['marker_size'],
+               color='red', edgecolor='black', linewidth=1.0)
+    ax.set_xlabel('PC1', fontweight='bold', fontsize=22)
+    ax.set_ylabel('PC2', fontweight='bold', fontsize=22)
+    ax.set_title(f'PCA Projection (Corr: {metrics["pca_correlation"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[1, 1]
+    ax.scatter(mds_real[:100, 0], mds_real[:100, 1], alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
+               color='blue', edgecolor='black', linewidth=1.0)
+    ax.scatter(mds_fake[:100, 0], mds_fake[:100, 1], alpha=0.6, label='Generated', s=HIGH_RES_CONFIG['marker_size'],
+               color='red', edgecolor='black', linewidth=1.0)
+    ax.set_xlabel('MDS Dimension 1', fontweight='bold', fontsize=22)
+    ax.set_ylabel('MDS Dimension 2', fontweight='bold', fontsize=22)
+    ax.set_title(f'MDS Projection (MMD: {metrics["mds_mmd"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[1, 2]
     stats_text = (
         f'Variogram MSE: {metrics["variogram_mse"]:.6f}\n'
         f'Connectivity MSE: {metrics["connectivity_mse"]:.6f}\n'
-        f'Histogram JS: {metrics["hist_kl"]:.6f}\n'
+        f'Histogram KL: {metrics["hist_kl"]:.6f}\n'
         f'PCA Correlation: {metrics["pca_correlation"]:.4f}\n'
-        f'MDS MMD: {metrics["mds_mmd"]:.4f}'
+        f'MDS MMD: {metrics["mds_mmd"]:.4f}\n\n'
+        f'Real mean: {np.mean(real_flat):.4f}\n'
+        f'Fake mean: {np.mean(fake_flat):.4f}\n'
+        f'Real std: {np.std(real_flat):.4f}\n'
+        f'Fake std: {np.std(fake_flat):.4f}'
     )
-    axes[1, 2].text(0.1, 0.5, stats_text, transform=axes[1, 2].transAxes,
-                    fontsize=18, verticalalignment='center',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    axes[1, 2].axis('off')
+    ax.text(0.1, 0.5, stats_text, transform=ax.transAxes,
+            fontsize=18, verticalalignment='center',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    ax.axis('off')
+    ax.set_title('Summary Statistics', fontweight='bold', fontsize=24)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     if save_path_base:
         saved_files = save_figure_multiple_formats(fig, save_path_base, HIGH_RES_CONFIG['dpi'])
+        print(f"Static metrics plots saved: {len(saved_files)} files")
     else:
+        plt.show()
         saved_files = []
     plt.close(fig)
     return metrics, saved_files
+
+
+def create_file_summary(prefix="latent_diffusion"):
+    summary = {}
+    for fmt in HIGH_RES_CONFIG['save_formats']:
+        pattern = f"training_outputs/{prefix}*.{fmt}"
+        files = glob.glob(pattern)
+        summary[fmt] = len(files)
+    other_files = []
+    for pattern in [f'{prefix}*.npy', f'{prefix}*.txt', f'{prefix}*.h5', f'{prefix}*.pkl']:
+        other_files.extend(glob.glob(f"training_outputs/{pattern}"))
+    summary['other'] = len(other_files)
+    summary['total'] = sum(summary.values())
+    return summary
 
 
 # ==============================================
@@ -1235,17 +1588,11 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         f.write("    Dropout            : 0.4 / 0.3\n")
         f.write("    BatchNormalization : Yes\n\n")
 
-        f.write("  Decoder (tanh):\n")
+        f.write("  Decoder:\n")
         f.write(f"    Input Dim          : {latent_dim}\n")
         f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
         f.write("    Output Act         : tanh\n")
         f.write("    Dropout            : 0.2\n\n")
-
-        f.write("  Decoder (softmax):\n")
-        f.write(f"    Input Dim          : {latent_dim}\n")
-        f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
-        f.write(f"    Num Classes        : {num_classes}\n")
-        f.write("    Output Act         : softmax\n\n")
 
         f.write("  UNet Denoiser (1D, real UNet):\n")
         f.write(f"    Input Dim          : {latent_dim}\n")
@@ -1273,8 +1620,7 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
             f"  Average time per epoch  : {(execution_time / len(loss_history.total_losses)) if loss_history.total_losses else 0:.2f} seconds\n")
         f.write(f"  Dataset                 : {name}\n")
         f.write(f"  Training samples        : {len(x_train)}\n")
-        f.write(f"  Test samples            : {len(x_test)}\n")
-        f.write(f"  Image generation        : Discrete (softmax + argmax)\n\n")
+        f.write(f"  Test samples            : {len(x_test)}\n\n")
 
         f.write("-" * 80 + "\n")
         f.write("GENERATED FILES\n")
@@ -1282,16 +1628,17 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
         saved_files_list = [
             "training_outputs/latent_diffusion_encoder_weights.h5",
             "training_outputs/latent_diffusion_decoder_weights.h5",
-            "training_outputs/latent_diffusion_decoder_softmax_weights.h5",
             "training_outputs/latent_diffusion_unet_weights.h5",
             "training_outputs/latent_diffusion_model_weights.h5",
             "training_outputs/latent_diffusion_encoder_model.h5",
             "training_outputs/latent_diffusion_decoder_model.h5",
-            "training_outputs/latent_diffusion_decoder_softmax_model.h5",
             "training_outputs/latent_diffusion_unet_model.h5",
             "training_outputs/latent_diffusion_best_weights.h5",
             "training_outputs/latent_diffusion_loss_history.txt",
-            "training_outputs/latent_diffusion_training_metrics.txt"
+            "training_outputs/latent_diffusion_training_metrics.txt",
+            "training_outputs/latent_diffusion_all_metrics.csv",
+            "training_outputs/latent_diffusion_distribution_data.pkl",
+            "training_outputs/latent_diffusion_execution_time.txt"
         ]
         for file in saved_files_list:
             f.write(f"  - {file}\n")
@@ -1309,8 +1656,10 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
 
 os.makedirs('training_outputs', exist_ok=True)
 
-train_dataset = tf.data.Dataset.from_tensor_slices((x_train, x_train)).shuffle(10000).batch(batch_size)
-test_dataset = tf.data.Dataset.from_tensor_slices((x_test, x_test)).batch(batch_size)
+train_dataset = tf.data.Dataset.from_tensor_slices((x_train.astype('float32'), x_train.astype('float32'))).shuffle(
+    10000).batch(batch_size)
+test_dataset = tf.data.Dataset.from_tensor_slices((x_test.astype('float32'), x_test.astype('float32'))).batch(
+    batch_size)
 
 SAVE_INTERVAL = 10
 
@@ -1347,9 +1696,16 @@ start_time = time.time()
 print("\n" + "=" * 60)
 print("STARTING LATENT DIFFUSION TRAINING")
 print("=" * 60)
-print(f"Denoiser: REAL 1D UNET (3 encoder levels + bottleneck + 3 decoder levels)")
-print(f"Training with dual decoders (continuous + discrete)")
-print(f"Image generation: discrete (softmax + argmax)")
+print(f"Latent dimension: {latent_dim}")
+print(f"Batch size: {batch_size}")
+print(f"Epochs: {epochs}")
+print(f"Learning rate: {initial_lr}")
+print(f"Number of diffusion timesteps: {num_timesteps}")
+print(f"Beta schedule: {beta_start} to {beta_end}")
+print(f"Save interval: {SAVE_INTERVAL} epochs")
+print(f"Metrics calculation interval: {SAVE_INTERVAL} epochs")
+print(f"Training samples: {len(x_train)}")
+print(f"Test samples: {len(x_test)}")
 print("=" * 60)
 
 history = diffusion_model.fit(
@@ -1374,49 +1730,33 @@ plt.ioff()
 end_time = time.time()
 execution_time = end_time - start_time
 
-print(f"\n[INFO] Training completed in {execution_time / 3600:.2f} hours")
+print(f"\n[INFO] Latent Diffusion training completed in {execution_time / 3600:.2f} hours")
 
-# ==============================================
-# FINAL ANALYSIS AND SAVING
-# ==============================================
 
-print("\n" + "=" * 60)
-print("FINAL ANALYSIS AND SAVING")
-print("=" * 60)
+def save_execution_time(filename, execution_time):
+    with open(filename, 'w') as f:
+        f.write(f"=== Latent Diffusion Execution Time ===\n")
+        f.write(f"Total: {execution_time:.2f} seconds\n")
+        f.write(f"Total: {execution_time / 60:.2f} minutes\n")
+        f.write(f"Total: {execution_time / 3600:.2f} hours\n")
+        f.write(f"\nSettings:\n")
+        f.write(f"- Batch size: {batch_size}\n")
+        f.write(f"- Epochs: {epochs}\n")
+        f.write(f"- Latent dim: {latent_dim}\n")
+        f.write(f"- Learning rate: {initial_lr}\n")
+        f.write(f"- Diffusion timesteps: {num_timesteps}\n")
+        f.write(f"- Save interval: {SAVE_INTERVAL} epochs\n")
+        f.write(f"- Metrics interval: {SAVE_INTERVAL} epochs\n")
 
-test_samples = x_test[:5]
-latents = diffusion_model.encoder.predict(test_samples, verbose=0)
 
-softmax_output = diffusion_model.decoder_softmax.predict(latents, verbose=0)
-discrete_output = np.argmax(softmax_output, axis=-1)
-reconstructions = discrete_output.astype(float) - 1.0
-reconstructions = np.expand_dims(reconstructions, axis=-1)
+save_execution_time("training_outputs/latent_diffusion_execution_time.txt", execution_time)
 
-latent_samples = analyze_latent_space(diffusion_model.encoder, x_test, num_samples=1000)
-
-print("Saving final distribution plots...")
-saved_dist_files = plot_histograms_and_densities(test_samples, reconstructions, latent_samples)
-print(f"Saved final distribution plots: {len(saved_dist_files)} files")
-
-figsize = (14 * HIGH_RES_CONFIG['figsize_multiplier'], 7 * HIGH_RES_CONFIG['figsize_multiplier'])
-fig = plt.figure(figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
-z_samples = diffusion_model.encoder.predict(x_test[:1000], verbose=0)
-pca = PCA(n_components=2)
-z_2d = pca.fit_transform(z_samples)
-plt.scatter(z_2d[:, 0], z_2d[:, 1], alpha=0.5, s=HIGH_RES_CONFIG['marker_size'])
-plt.title('2D Projection of Latent Space (PCA)', fontsize=24, fontweight='bold')
-plt.xlabel('PCA Component 1', fontweight='bold', fontsize=22)
-plt.ylabel('PCA Component 2', fontweight='bold', fontsize=22)
-plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-save_figure_multiple_formats(fig, "training_outputs/latent_diffusion_latent_space_2d", HIGH_RES_CONFIG['dpi'])
-plt.close(fig)
-
-static_metrics_results, saved_static_files = plot_static_metrics_comparison(
-    x_test, diffusion_model, save_path_base='training_outputs/latent_diffusion_static_metrics_comparison'
-)
+saved_loss_files = plot_losses(loss_history_callback, save_prefix="latent_diffusion")
+print(f"Saved final loss plots: {len(saved_loss_files)} files")
 
 with open('training_outputs/latent_diffusion_loss_history.txt', 'w') as f:
-    f.write("Epoch\tTotal_Loss\tDiffusion_Loss\tRecon_Loss\tVal_Total_Loss\tVal_Diffusion_Loss\tVal_Recon_Loss\n")
+    f.write("Epoch\tTotal_Loss\tDiffusion_Loss\tRecon_Loss\t"
+            "Val_Total_Loss\tVal_Diffusion_Loss\tVal_Recon_Loss\n")
     for i in range(len(loss_history_callback.total_losses)):
         f.write(f"{i + 1}\t"
                 f"{loss_history_callback.total_losses[i]:.6f}\t"
@@ -1426,18 +1766,102 @@ with open('training_outputs/latent_diffusion_loss_history.txt', 'w') as f:
                 f"{loss_history_callback.val_diffusion_losses[i]:.6f}\t"
                 f"{loss_history_callback.val_recon_losses[i]:.6f}\n")
 
-print("Saving model weights...")
 encoder.save_weights('training_outputs/latent_diffusion_encoder_weights.h5')
 decoder.save_weights('training_outputs/latent_diffusion_decoder_weights.h5')
-decoder_softmax.save_weights('training_outputs/latent_diffusion_decoder_softmax_weights.h5')
 unet.save_weights('training_outputs/latent_diffusion_unet_weights.h5')
 diffusion_model.save_weights('training_outputs/latent_diffusion_model_weights.h5')
 
-print("Saving models...")
 encoder.save('training_outputs/latent_diffusion_encoder_model.h5')
 decoder.save('training_outputs/latent_diffusion_decoder_model.h5')
-decoder_softmax.save('training_outputs/latent_diffusion_decoder_softmax_model.h5')
 unet.save('training_outputs/latent_diffusion_unet_model.h5')
+tf.saved_model.save(diffusion_model, 'training_outputs/latent_diffusion_final_model')
+
+print("\n" + "=" * 60)
+print("FINAL ANALYSIS AND SAVING")
+print("=" * 60)
+
+test_samples = x_test[:5]
+latents = diffusion_model.encoder.predict(test_samples, verbose=0)
+reconstructions = diffusion_model.decoder.predict(latents, verbose=0)
+latent_samples = analyze_latent_space(diffusion_model.encoder, x_test, num_samples=1000)
+
+print("Saving final distribution plots...")
+saved_dist_files = plot_histograms_and_densities(test_samples, reconstructions, latent_samples)
+print(f"Saved final distribution plots: {len(saved_dist_files)} files")
+
+print("Saving latent space visualization...")
+figsize = (14 * HIGH_RES_CONFIG['figsize_multiplier'],
+           8 * HIGH_RES_CONFIG['figsize_multiplier'])
+fig = plt.figure(figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
+plt.rcParams.update({
+    'font.size': 20,
+    'axes.titlesize': 24,
+    'axes.labelsize': 22,
+    'xtick.labelsize': 18,
+    'ytick.labelsize': 18
+})
+latent_samples_proj = diffusion_model.encoder.predict(x_test[:1000], verbose=0)
+pca = PCA(n_components=2)
+latent_2d = pca.fit_transform(latent_samples_proj)
+plt.scatter(latent_2d[:, 0], latent_2d[:, 1], alpha=0.5, s=HIGH_RES_CONFIG['marker_size'])
+plt.title('Latent Diffusion: 2D Projection of Latent Space (PCA)',
+          fontsize=24, fontweight='bold')
+plt.xlabel('PCA Component 1', fontweight='bold', fontsize=22)
+plt.ylabel('PCA Component 2', fontweight='bold', fontsize=22)
+plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+plt.tick_params(axis='both', which='major', labelsize=18, width=2)
+base_filename = "training_outputs/latent_diffusion_latent_space_2d"
+saved_latent_files = save_figure_multiple_formats(fig, base_filename, HIGH_RES_CONFIG['dpi'])
+print(f"Saved final latent space plots: {len(saved_latent_files)} files")
+plt.close(fig)
+
+print("Saving final static metrics comparison...")
+static_metrics_results, saved_static_files = plot_static_metrics_comparison(
+    x_test, diffusion_model, save_path_base='training_outputs/latent_diffusion_static_metrics_comparison'
+)
+print(f"Saved final static metrics plots: {len(saved_static_files)} files")
+
+print("Saving distribution data...")
+dist_data = {
+    'original': test_samples.flatten(),
+    'reconstructed': reconstructions.flatten(),
+    'latent': latent_samples.flatten() if isinstance(latent_samples, np.ndarray) else latent_samples,
+    'latent_2d_projection': latent_2d
+}
+with open('training_outputs/latent_diffusion_distribution_data.pkl', 'wb') as f:
+    pickle.dump(dist_data, f)
+print("Saved distribution data to pickle file")
+
+file_summary = create_file_summary("latent_diffusion")
+print("\n" + "=" * 60)
+print("LATENT DIFFUSION FILE SAVING SUMMARY")
+print("=" * 60)
+print(f"PNG files saved: {file_summary['png']}")
+print(f"SVG files saved: {file_summary['svg']}")
+print(f"Other files (npy, txt, h5, pkl): {file_summary['other']}")
+print(f"TOTAL files saved: {file_summary['total']}")
+print("=" * 60)
+
+print("Saving final reconstructions comparison...")
+fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+for i in range(5):
+    axes[0, i].imshow(test_samples[i].squeeze(), cmap='viridis')
+    axes[0, i].set_title(f'Original {i + 1}', fontsize=20, fontweight='bold')
+    axes[0, i].axis('off')
+    axes[1, i].imshow(reconstructions[i].squeeze(), cmap='viridis')
+    axes[1, i].set_title(f'Reconstructed {i + 1}', fontsize=20, fontweight='bold')
+    axes[1, i].axis('off')
+plt.suptitle('Latent Diffusion: Final Reconstruction Comparison',
+             fontsize=26, fontweight='bold')
+plt.tight_layout()
+saved_final_files = save_figure_multiple_formats(fig, "training_outputs/latent_diffusion_final_reconstructions",
+                                                 HIGH_RES_CONFIG['dpi'])
+print(f"Saved final reconstruction comparison: {len(saved_final_files)} files")
+plt.show()
+
+# ==============================================
+# GENERATE AND SAVE FINAL REPORT
+# ==============================================
 
 training_params = {
     'Dataset': name,
@@ -1449,21 +1873,20 @@ training_params = {
     'Gamma (perceptual weight)': gamma,
     'Alpha (LeakyReLU)': alpha,
     'Image dimensions (ni x nj x nz)': f'{ni} x {nj} x {nz}',
-    'Number of classes': num_classes,
     'Diffusion timesteps': num_timesteps,
     'Beta start': beta_start,
     'Beta end': beta_end,
     'Training samples': len(x_train),
     'Test samples': len(x_test),
-    'Model': 'Latent Diffusion with real 1D UNet denoiser',
+    'Model': 'Latent Diffusion Model with real 1D UNet denoiser',
     'UNet structure': 'Encoder(3) + Bottleneck(2x) + Decoder(3) with skip connections',
     'UNet base filters': 64,
     'UNet time emb dim': 256,
     'Optimizer': 'Adam (beta1=0.5, clipnorm=1.0)',
     'Early Stopping': 'Yes (patience=20, monitor=val_loss)',
     'LR Scheduler': 'ReduceLROnPlateau (factor=0.5, patience=5)',
-    'Image generation': 'Discrete (softmax + argmax)',
-    'Metric interval': metric_interval
+    'Metric interval': metric_interval,
+    'Save interval': SAVE_INTERVAL
 }
 
 report_path = os.path.join('training_outputs', 'latent_diffusion_final_report.txt')
@@ -1477,13 +1900,14 @@ generate_final_report(
 )
 
 print("\n" + "=" * 60)
-print("TRAINING COMPLETED SUCCESSFULLY")
+print("LATENT DIFFUSION TRAINING COMPLETED SUCCESSFULLY")
 print("=" * 60)
-print(f"Execution time: {execution_time / 3600:.2f} hours")
-if len(loss_history_callback.total_losses) > 0:
-    print(f"Total epochs trained: {len(loss_history_callback.total_losses)}")
-    print(f"Final Training Total Loss: {loss_history_callback.total_losses[-1]:.4f}")
-    print(f"Final Validation Total Loss: {loss_history_callback.val_total_losses[-1]:.4f}")
+print(f"Training Summary:")
+print(f"- Total epochs: {epochs}")
+print(f"- Save interval: {SAVE_INTERVAL} epochs")
+print(f"- Metrics calculation interval: {SAVE_INTERVAL} epochs")
+print(f"- Execution time: {execution_time / 3600:.2f} hours")
+print(f"- Total files saved: {file_summary['total']}")
 print("=" * 60)
 print(f"\nFinal complete report saved to: {report_path}")
 print("=" * 60)
