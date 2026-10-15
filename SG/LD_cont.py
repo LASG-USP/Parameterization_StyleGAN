@@ -74,6 +74,10 @@ num_timesteps = 1000
 beta_start = 0.0001
 beta_end = 0.02
 
+# >>> Reduzido de 1000 para 500: FID só usa [:500] e static metrics só usa min(500,...)
+# Isso corta ~50% do tempo do callback de métricas sem alterar NENHUM resultado.
+FID_SAMPLE_SIZE = 500
+
 HIGH_RES_CONFIG = {
     'dpi': 300,
     'figsize_multiplier': 1.5,
@@ -111,6 +115,17 @@ x_train = X_train[:train_size].astype('float32')
 x_test = X_train[train_size:].astype('float32')
 
 latent_dim = zdim
+
+print(f"\n{'=' * 60}")
+print(f"DATASET INFO")
+print(f"{'=' * 60}")
+print(f"Image shape: {ni} x {nj} x {nz}")
+print(f"Training samples: {len(x_train)}")
+print(f"Test samples: {len(x_test)}")
+print(f"Latent dimension: {latent_dim}")
+print(f"Diffusion steps: {num_timesteps}")
+print(f"FID/FRD sample size: {FID_SAMPLE_SIZE}")
+print(f"{'=' * 60}\n")
 
 
 class MemoryOptimizer:
@@ -536,7 +551,7 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
     b = res_block(e3, t_emb, base_filters * 8, "bottleneck_1")
     b = res_block(b, t_emb, base_filters * 8, "bottleneck_2")
 
-    # DECODER (with correct skips)
+    # DECODER with correct skips
     u3 = upsample_with_skip(b, e2, base_filters * 4, "dec3")
     u3 = res_block(u3, t_emb, base_filters * 4, "dec3_res")
 
@@ -628,22 +643,25 @@ class DiffusionModel(keras.Model):
             noise = tf.random.normal(shape=tf.shape(x), dtype=tf.float32)
             return model_mean + tf.sqrt(posterior_variance_t) * noise
 
-    def sample(self, num_samples, training=False):
-        print(f"\nGenerating {num_samples} samples...")
+    def sample(self, num_samples, training=False, verbose=True):
+        if verbose:
+            print(f"\nGenerating {num_samples} samples...")
         x = tf.random.normal((num_samples, latent_dim), dtype=tf.float32)
         for i in range(self.num_timesteps - 1, -1, -1):
             t = tf.ones((num_samples,), dtype=tf.int32) * i
             x = self.p_sample(x, t, i)
-            if i % 100 == 0 or i < 10:
+            if verbose and (i % 100 == 0 or i < 10):
                 print(f"  Timestep {i + 1}/{self.num_timesteps}")
-        print("Decoding latents to images...")
+        if verbose:
+            print("Decoding latents to images...")
         generated_images = self.decoder(x, training=training)
         if isinstance(generated_images, tf.Tensor):
             generated_images = generated_images.numpy()
         generated_images = np.clip(generated_images, -1.0, 1.0)
-        img_mean = np.mean(np.abs(generated_images))
-        print(f"Sample generation complete. Mean absolute value: {img_mean:.4f}")
-        print(f"Range: [{generated_images.min():.3f}, {generated_images.max():.3f}]")
+        if verbose:
+            img_mean = np.mean(np.abs(generated_images))
+            print(f"Sample generation complete. Mean absolute value: {img_mean:.4f}")
+            print(f"Range: [{generated_images.min():.3f}, {generated_images.max():.3f}]")
         return generated_images
 
     def train_step(self, data):
@@ -944,7 +962,8 @@ class LivePlotCallback(keras.callbacks.Callback):
 
 
 class EnhancedMetricCallback(tf.keras.callbacks.Callback):
-    def __init__(self, diffusion_model, encoder, x_test, metric_interval=metric_interval, save_interval=10,
+    def __init__(self, diffusion_model, encoder, x_test, metric_interval=metric_interval,
+                 save_interval=10, sample_size=FID_SAMPLE_SIZE,
                  log_file='latent_diffusion_training_metrics.txt'):
         super().__init__()
         self.diffusion_model = diffusion_model
@@ -952,6 +971,7 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
         self.x_test = x_test
         self.metric_interval = metric_interval
         self.save_interval = save_interval
+        self.sample_size = sample_size
         self.log_file = log_file
         self.metrics = {
             'FID_10k': [], 'FRD_10k': [], 'KID_10k': [], 'KRD_10k': [],
@@ -972,19 +992,24 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             print(f'Latent Diffusion: Computing metrics at epoch {epoch + 1}')
             print(f'{"=" * 60}')
             MemoryOptimizer.check_memory(threshold_mb=8000)
-            size = min(1000, self.x_test.shape[0])
-            fake_data = self.diffusion_model.sample(num_samples=size, training=False)
+
+            # ---------- amostras ----------
+            size = min(self.sample_size, self.x_test.shape[0])
+            fake_data = self.diffusion_model.sample(num_samples=size, training=False, verbose=False)
             if isinstance(fake_data, tf.Tensor):
                 fake_data = fake_data.numpy()
             if np.any(np.isnan(fake_data)):
                 print(f"Warning: Generated data contains NaN values")
                 fake_data = np.nan_to_num(fake_data, nan=0.0)
+
             static_results = self.compute_static_metrics_corrected(self.x_test[:size], fake_data[:size])
             training_metrics = {
                 'total_loss': logs.get('loss', 0),
                 'diffusion_loss': logs.get('diffusion_loss', 0),
                 'recon_loss': logs.get('reconstruction_loss', 0)
             }
+
+            # ---------- FID/FRD/KID/KRD ----------
             try:
                 from metrics import frechet_distance, kernel_distance
                 real_resized = tf.image.resize(np.repeat(self.x_test[:size], 3, axis=3), [75, 75])
@@ -995,8 +1020,10 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                 act_gen_rc = f_extraction_rc.predict(fake_data, verbose=0)
                 fid_500 = frechet_distance(act_train_iv3[:500], act_gen_iv3[:500])
                 frd_500 = frechet_distance(act_train_rc[:500], act_gen_rc[:500])
-                kid_500 = kernel_distance(act_train_iv3[:500], act_gen_iv3[:500], num_blocks=50, max_block_size=500)
-                krd_500 = kernel_distance(act_train_rc[:500], act_gen_rc[:500], num_blocks=50, max_block_size=500)
+                kid_500 = kernel_distance(act_train_iv3[:500], act_gen_iv3[:500],
+                                          num_blocks=50, max_block_size=500)
+                krd_500 = kernel_distance(act_train_rc[:500], act_gen_rc[:500],
+                                          num_blocks=50, max_block_size=500)
                 traditional_results = {
                     'FID_500': fid_500, 'FRD_500': frd_500,
                     'KID_500': kid_500, 'KRD_500': krd_500
@@ -1007,6 +1034,7 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                     'FID_500': 0, 'FRD_500': 0,
                     'KID_500': 0, 'KRD_500': 0
                 }
+
             for key in ['FID_500', 'FRD_500', 'KID_500', 'KRD_500']:
                 self.metrics[key].append(traditional_results[key])
             for key in self.static_metrics:
@@ -1338,9 +1366,10 @@ def plot_individual_losses(loss_history, save_prefix="latent_diffusion"):
         plt.close(fig)
 
 
-def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=None):
-    n_samples = min(500, len(real_data))
-    fake_data = diffusion_model.sample(n_samples, training=False)
+def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=None,
+                                   sample_size=FID_SAMPLE_SIZE):
+    n_samples = min(sample_size, len(real_data))
+    fake_data = diffusion_model.sample(n_samples, training=False, verbose=False)
     if isinstance(fake_data, tf.Tensor):
         fake_data = fake_data.numpy()
     if np.any(np.isnan(fake_data)):
@@ -1620,7 +1649,8 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
             f"  Average time per epoch  : {(execution_time / len(loss_history.total_losses)) if loss_history.total_losses else 0:.2f} seconds\n")
         f.write(f"  Dataset                 : {name}\n")
         f.write(f"  Training samples        : {len(x_train)}\n")
-        f.write(f"  Test samples            : {len(x_test)}\n\n")
+        f.write(f"  Test samples            : {len(x_test)}\n")
+        f.write(f"  FID/FRD sample size     : {FID_SAMPLE_SIZE}\n\n")
 
         f.write("-" * 80 + "\n")
         f.write("GENERATED FILES\n")
@@ -1670,6 +1700,7 @@ distribution_callback = DistributionPlotCallback(diffusion_model, x_test, plot_i
 enhanced_metric_callback = EnhancedMetricCallback(
     diffusion_model, encoder, x_test,
     metric_interval=SAVE_INTERVAL, save_interval=SAVE_INTERVAL,
+    sample_size=FID_SAMPLE_SIZE,
     log_file='latent_diffusion_training_metrics.txt'
 )
 
@@ -1704,6 +1735,7 @@ print(f"Number of diffusion timesteps: {num_timesteps}")
 print(f"Beta schedule: {beta_start} to {beta_end}")
 print(f"Save interval: {SAVE_INTERVAL} epochs")
 print(f"Metrics calculation interval: {SAVE_INTERVAL} epochs")
+print(f"FID/FRD sample size: {FID_SAMPLE_SIZE}")
 print(f"Training samples: {len(x_train)}")
 print(f"Test samples: {len(x_test)}")
 print("=" * 60)
@@ -1747,6 +1779,7 @@ def save_execution_time(filename, execution_time):
         f.write(f"- Diffusion timesteps: {num_timesteps}\n")
         f.write(f"- Save interval: {SAVE_INTERVAL} epochs\n")
         f.write(f"- Metrics interval: {SAVE_INTERVAL} epochs\n")
+        f.write(f"- FID/FRD sample size: {FID_SAMPLE_SIZE}\n")
 
 
 save_execution_time("training_outputs/latent_diffusion_execution_time.txt", execution_time)
@@ -1817,7 +1850,9 @@ plt.close(fig)
 
 print("Saving final static metrics comparison...")
 static_metrics_results, saved_static_files = plot_static_metrics_comparison(
-    x_test, diffusion_model, save_path_base='training_outputs/latent_diffusion_static_metrics_comparison'
+    x_test, diffusion_model,
+    save_path_base='training_outputs/latent_diffusion_static_metrics_comparison',
+    sample_size=FID_SAMPLE_SIZE
 )
 print(f"Saved final static metrics plots: {len(saved_static_files)} files")
 
@@ -1886,7 +1921,8 @@ training_params = {
     'Early Stopping': 'Yes (patience=20, monitor=val_loss)',
     'LR Scheduler': 'ReduceLROnPlateau (factor=0.5, patience=5)',
     'Metric interval': metric_interval,
-    'Save interval': SAVE_INTERVAL
+    'Save interval': SAVE_INTERVAL,
+    'FID/FRD sample size': FID_SAMPLE_SIZE
 }
 
 report_path = os.path.join('training_outputs', 'latent_diffusion_final_report.txt')
