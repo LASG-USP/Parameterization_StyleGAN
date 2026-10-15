@@ -79,7 +79,7 @@ beta_end = 0.02
 FID_SAMPLE_SIZE = 500
 
 # Chunk size para o sampling — reduz pico de memória do UNet em ~8x.
-SAMPLE_CHUNK_SIZE = 64
+SAMPLE_CHUNK_SIZE = 32
 
 HIGH_RES_CONFIG = {
     'dpi': 300,
