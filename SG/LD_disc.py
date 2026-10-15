@@ -211,6 +211,18 @@ def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
     return saved_files
 
 
+def get_feature_extractors():
+    iv3 = InceptionV3(include_top=False, pooling='avg', input_shape=(75, 75, 3))
+    f_extraction_iv3 = Model(inputs=iv3.input, outputs=iv3.layers[-1].output)
+    RC_full = load_model('Reservoir_classifier.h5')
+    f_extraction_rc = Model(inputs=RC_full.input,
+                            outputs=layers.GlobalAveragePooling2D()(RC_full.layers[-5].output))
+    return f_extraction_iv3, f_extraction_rc
+
+
+f_extraction_iv3, f_extraction_rc = get_feature_extractors()
+
+
 # ==============================================
 # LDM ARCHITECTURE
 # ==============================================
@@ -242,6 +254,7 @@ encoder = build_encoder((ni, nj, nz), latent_dim)
 
 
 def build_decoder(latent_dim, output_shape):
+    """Decoder with tanh - ORIGINAL from first code"""
     latent_inputs = keras.Input(shape=(latent_dim,))
     x = layers.Dense(6 * 6 * 256)(latent_inputs)
     x = LeakyReLU(alpha=0.2)(x)
@@ -294,31 +307,20 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
     """
     Real 1D UNet for latent diffusion denoising.
 
-    Treats the flattened latent vector (latent_dim,) as a 1D sequence of length
-    latent_dim with 1 channel, then applies an encoder / bottleneck / decoder
-    structure with skip connections.
-
     Levels (for latent_dim=512, base_filters=64):
         e0: 512 x 64
         e1: 256 x 128
         e2: 128 x 256
-        e3:  64 x 512
+        e3:  64 x 512   <- entrada do bottleneck
         bottleneck: 64 x 512 (x2 residual blocks)
         U3: 128 x 256   (skip from e2)
         U2: 256 x 128   (skip from e1)
         U1: 512 x 64    (skip from e0)
         out: 512 x 1
-
-    Returns:
-        keras.Model([latent_input, time_input], output)
-        - latent_input: (B, latent_dim)
-        - time_input:   (B, 1)
-        - output:       (B, latent_dim)
     """
     assert latent_dim % 8 == 0, \
         f"latent_dim must be divisible by 8 for 3 pooling levels (got {latent_dim})"
 
-    # ---------- Time embedding ----------
     def sinusoidal_embedding(x):
         half_dim = time_emb_dim // 2
         emb = tf.math.log(10000.0) / (half_dim - 1)
@@ -327,19 +329,16 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
         emb = x * emb
         return tf.concat([tf.sin(emb), tf.cos(emb)], axis=1)
 
-    # ---------- Building blocks ----------
     def time_mlp(t_emb):
         x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_1")(t_emb)
         x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_2")(x)
         return x
 
     def res_block(x, t_emb, filters, name):
-        """1D residual block with time conditioning (additive bias)."""
         h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv1")(x)
         h = layers.LayerNormalization(name=f"{name}_ln1")(h)
         h = layers.Activation("swish", name=f"{name}_act1")(h)
 
-        # time conditioning: project t_emb to `filters` and broadcast over time
         t = layers.Dense(filters, name=f"{name}_tproj")(t_emb)
         t = layers.Reshape((1, filters), name=f"{name}_treshape")(t)
         h = layers.Add(name=f"{name}_tadd")([h, t])
@@ -347,7 +346,6 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
         h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv2")(h)
         h = layers.LayerNormalization(name=f"{name}_ln2")(h)
 
-        # residual projection if channel count changes
         if x.shape[-1] != filters:
             x = layers.Conv1D(filters, 1, padding="same", name=f"{name}_skip_proj")(x)
 
@@ -359,66 +357,51 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
 
     def upsample_with_skip(x, skip, filters, name):
         x = layers.UpSampling1D(size=2, name=f"{name}_up")(x)
-        # sanity check
         assert x.shape[1] == skip.shape[1], (
             f"[{name}] upsampled length {x.shape[1]} != skip length {skip.shape[1]}. "
-
+            f"Confira qual nível está sendo passado como skip."
         )
         x = layers.Concatenate(name=f"{name}_concat")([x, skip])
         x = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv")(x)
         x = layers.LayerNormalization(name=f"{name}_ln")(x)
         return layers.Activation("swish", name=f"{name}_act")(x)
 
-    # ---------- Inputs ----------
     latent_input = keras.Input(shape=(latent_dim,), name="latent_input")
     time_input = keras.Input(shape=(1,), name="time_input")
 
     t_emb = sinusoidal_embedding(time_input)
     t_emb = time_mlp(t_emb)
 
-    # Reshape (B, latent_dim) -> (B, latent_dim, 1)
     x = layers.Reshape((latent_dim, 1), name="reshape_input")(latent_input)
     x = layers.Conv1D(base_filters, 3, padding="same", name="input_conv")(x)
 
-    # ============ ENCODER ============
-    # e0: 512 x base
+    # ENCODER
     e0 = res_block(x, t_emb, base_filters, "enc0")
-
-    # e1: 256 x base*2
     d1 = downsample(e0, base_filters * 2, "enc1_down")
     e1 = res_block(d1, t_emb, base_filters * 2, "enc1")
-
-    # e2: 128 x base*4
     d2 = downsample(e1, base_filters * 4, "enc2_down")
     e2 = res_block(d2, t_emb, base_filters * 4, "enc2")
-
-    # e3: 64 x base*8
     d3 = downsample(e2, base_filters * 8, "enc3_down")
     e3 = res_block(d3, t_emb, base_filters * 8, "enc3")
 
-    # ============ BOTTLENECK ============
+    # BOTTLENECK
     b = res_block(e3, t_emb, base_filters * 8, "bottleneck_1")
     b = res_block(b, t_emb, base_filters * 8, "bottleneck_2")
 
-    # ============ DECODER (with skip connections) ============
-    # U3: 128 (skip from e2, which is at 128 with base*4 channels)
+    # DECODER with correct skips
     u3 = upsample_with_skip(b, e2, base_filters * 4, "dec3")
     u3 = res_block(u3, t_emb, base_filters * 4, "dec3_res")
 
-    # U2: 256 (skip from e1, which is at 256 with base*2 channels)
     u2 = upsample_with_skip(u3, e1, base_filters * 2, "dec2")
     u2 = res_block(u2, t_emb, base_filters * 2, "dec2_res")
 
-    # U1: 512 (skip from e0, which is at 512 with base channels)
     u1 = upsample_with_skip(u2, e0, base_filters, "dec1")
     u1 = res_block(u1, t_emb, base_filters, "dec1_res")
 
-    # ============ OUTPUT ============
+    # OUTPUT
     out = layers.Conv1D(base_filters, 3, padding="same", name="out_conv1")(u1)
     out = layers.Activation("swish", name="out_act")(out)
     out = layers.Conv1D(1, 3, padding="same", name="out_conv2")(out)
-
-    # (B, latent_dim, 1) -> (B, latent_dim)
     out = layers.Reshape((latent_dim,), name="output_reshape")(out)
 
     return keras.Model([latent_input, time_input], out, name="unet_1d")
@@ -860,10 +843,33 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
                 'diffusion_loss': logs.get('diffusion_loss', 0),
                 'recon_loss': logs.get('reconstruction_loss', 0)
             }
-            traditional_results = {
-                'FID_500': 0, 'FRD_500': 0,
-                'KID_500': 0, 'KRD_500': 0
-            }
+
+            # -------- FID/FRD/KID/KRD (real computation) --------
+            try:
+                from metrics import frechet_distance, kernel_distance
+                real_resized = tf.image.resize(np.repeat(self.x_test[:size], 3, axis=3), [75, 75])
+                fake_resized = tf.image.resize(np.repeat(fake_data, 3, axis=3), [75, 75])
+                act_train_iv3 = f_extraction_iv3.predict(real_resized, verbose=0)
+                act_gen_iv3 = f_extraction_iv3.predict(fake_resized, verbose=0)
+                act_train_rc = f_extraction_rc.predict(self.x_test[:size], verbose=0)
+                act_gen_rc = f_extraction_rc.predict(fake_data, verbose=0)
+                fid_500 = frechet_distance(act_train_iv3[:500], act_gen_iv3[:500])
+                frd_500 = frechet_distance(act_train_rc[:500], act_gen_rc[:500])
+                kid_500 = kernel_distance(act_train_iv3[:500], act_gen_iv3[:500],
+                                          num_blocks=50, max_block_size=500)
+                krd_500 = kernel_distance(act_train_rc[:500], act_gen_rc[:500],
+                                          num_blocks=50, max_block_size=500)
+                traditional_results = {
+                    'FID_500': fid_500, 'FRD_500': frd_500,
+                    'KID_500': kid_500, 'KRD_500': krd_500
+                }
+            except ImportError:
+                print("Warning: metrics.py not found. Using placeholder values.")
+                traditional_results = {
+                    'FID_500': 0, 'FRD_500': 0,
+                    'KID_500': 0, 'KRD_500': 0
+                }
+
             for key in ['FID_500', 'FRD_500', 'KID_500', 'KRD_500']:
                 self.metrics[key].append(traditional_results[key])
             for key in self.static_metrics:
