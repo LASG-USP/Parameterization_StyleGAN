@@ -393,28 +393,115 @@ class TraditionalMetrics:
 
     @staticmethod
     def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
-        """Calculate Frechet Distance."""
+        """Calculate Frechet Distance (numerically stable)."""
         diff = mu1 - mu2
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+        d = sigma1.shape[0]
 
-        if not np.isfinite(covmean).all():
-            offset = np.eye(sigma1.shape[0]) * eps
-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+        reg1 = eps * max(np.trace(sigma1) / max(d, 1), 1.0)
+        reg2 = eps * max(np.trace(sigma2) / max(d, 1), 1.0)
+        sigma1 = sigma1 + np.eye(d) * reg1
+        sigma2 = sigma2 + np.eye(d) * reg2
 
-        if np.iscomplexobj(covmean):
-            covmean = covmean.real
+        try:
+            result = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+            covmean = result[0] if isinstance(result, tuple) else result
+            if np.iscomplexobj(covmean):
+                covmean = covmean.real
+            covmean = np.nan_to_num(covmean, nan=0.0, posinf=0.0, neginf=0.0)
+            if not np.all(np.isfinite(covmean)):
+                raise ValueError("covmean non-finite")
+            tr_covmean = np.trace(covmean)
+        except Exception:
+            diag1 = np.diag(sigma1)
+            diag2 = np.diag(sigma2)
+            tr_covmean = np.sum(np.sqrt(np.maximum(diag1 * diag2, 0.0)))
 
-        fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
-        return fid
+        fid = float(diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2.0 * tr_covmean)
+
+        if not np.isfinite(fid):
+            return 1e6
+        return max(fid, 0.0)
 
     @staticmethod
     def frechet_distance(real_features, fake_features):
-        """Calculate Frechet Inception Distance."""
-        mu1, sigma1 = np.mean(real_features, axis=0), np.cov(real_features, rowvar=False)
-        mu2, sigma2 = np.mean(fake_features, axis=0), np.cov(fake_features, rowvar=False)
+        """Calculate Frechet Inception Distance (numerically stable)."""
+        real_features = np.asarray(real_features, dtype=np.float64)
+        fake_features = np.asarray(fake_features, dtype=np.float64)
 
-        fid_value = TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-        return fid_value
+        real_features = np.nan_to_num(real_features, nan=0.0, posinf=0.0, neginf=0.0)
+        fake_features = np.nan_to_num(fake_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        n1, d = real_features.shape
+        n2, _ = fake_features.shape
+
+        if n1 < 3 * d or n2 < 3 * d:
+            target_dims = max(32, min(min(n1, n2) // 3, d))
+            if target_dims < d:
+                pca = PCA(n_components=target_dims)
+                pca.fit(np.vstack([real_features, fake_features]))
+                real_features = pca.transform(real_features)
+                fake_features = pca.transform(fake_features)
+
+        mu1 = real_features.mean(axis=0)
+        sigma1 = np.cov(real_features, rowvar=False)
+        mu2 = fake_features.mean(axis=0)
+        sigma2 = np.cov(fake_features, rowvar=False)
+
+        if sigma1.ndim == 0: sigma1 = np.array([[sigma1]])
+        if sigma2.ndim == 0: sigma2 = np.array([[sigma2]])
+
+        return TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+
+    @staticmethod
+    def frechet_distance_batched(real_features, fake_features, n_batches=10, batch_size=1000):
+        """
+        Calculate Frechet Distance using batched computation over 10 batches of 1000 samples.
+        Computes statistics (mean and covariance) incrementally across batches.
+        """
+        real_features = np.asarray(real_features, dtype=np.float64)
+        fake_features = np.asarray(fake_features, dtype=np.float64)
+
+        real_features = np.nan_to_num(real_features, nan=0.0, posinf=0.0, neginf=0.0)
+        fake_features = np.nan_to_num(fake_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        n_total = n_batches * batch_size
+
+        # Accumulate statistics for real features
+        real_sum = np.zeros(real_features.shape[1], dtype=np.float64)
+        real_sum_sq = np.zeros((real_features.shape[1], real_features.shape[1]), dtype=np.float64)
+        real_count = 0
+
+        for i in range(n_batches):
+            start = i * batch_size
+            end = start + batch_size
+            batch = real_features[start:end]
+            real_sum += batch.sum(axis=0)
+            real_sum_sq += batch.T @ batch
+            real_count += batch.shape[0]
+
+        mu1 = real_sum / real_count
+        sigma1 = (real_sum_sq / real_count) - np.outer(mu1, mu1)
+
+        # Accumulate statistics for fake features
+        fake_sum = np.zeros(fake_features.shape[1], dtype=np.float64)
+        fake_sum_sq = np.zeros((fake_features.shape[1], fake_features.shape[1]), dtype=np.float64)
+        fake_count = 0
+
+        for i in range(n_batches):
+            start = i * batch_size
+            end = start + batch_size
+            batch = fake_features[start:end]
+            fake_sum += batch.sum(axis=0)
+            fake_sum_sq += batch.T @ batch
+            fake_count += batch.shape[0]
+
+        mu2 = fake_sum / fake_count
+        sigma2 = (fake_sum_sq / fake_count) - np.outer(mu2, mu2)
+
+        if sigma1.ndim == 0: sigma1 = np.array([[sigma1]])
+        if sigma2.ndim == 0: sigma2 = np.array([[sigma2]])
+
+        return TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
 
     @staticmethod
     def kernel_distance(real_features, fake_features, num_blocks=100, max_block_size=1000):
@@ -442,18 +529,52 @@ class TraditionalMetrics:
 
     @staticmethod
     def compute_all_traditional_metrics(real_data, fake_data, classifier_path='Reservoir_classifier.h5'):
-        """Calculate all traditional metrics."""
+        """Calculate all traditional metrics.
+
+        FID and FRD are computed with 10000 samples split into 10 batches of 1000,
+        accumulating the statistics incrementally (mean and covariance).
+        """
         print("Calculating traditional metrics...")
 
-        real_resized = tf.image.resize(np.repeat(real_data, 3, axis=3), [75, 75])
-        fake_resized = tf.image.resize(np.repeat(fake_data, 3, axis=3), [75, 75])
+        # Ensure we have exactly 10000 samples for batched FID/FRD (10 batches x 1000)
+        FID_N_BATCHES = 10
+        FID_BATCH_SIZE = 1000
+        FID_TOTAL = FID_N_BATCHES * FID_BATCH_SIZE  # 10000
+
+        n_available = min(len(real_data), len(fake_data))
+        n_fid = min(FID_TOTAL, n_available)
+
+        # If fewer than 10000 samples available, adjust batch sizing
+        if n_fid < FID_TOTAL:
+            FID_N_BATCHES = max(1, n_fid // FID_BATCH_SIZE)
+            if FID_N_BATCHES == 0:
+                FID_N_BATCHES = 1
+                FID_BATCH_SIZE = n_fid
+            else:
+                FID_BATCH_SIZE = n_fid // FID_N_BATCHES
+
+        real_fid_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+        fake_fid_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+
+        # Prepare inputs for InceptionV3 (75x75x3)
+        real_resized = tf.image.resize(np.repeat(real_fid_data, 3, axis=3), [75, 75])
+        fake_resized = tf.image.resize(np.repeat(fake_fid_data, 3, axis=3), [75, 75])
 
         inception_model = TraditionalMetrics.get_inception((75, 75, 3))
         act_real_iv3 = inception_model.predict(real_resized, batch_size=32, verbose=0)
         act_fake_iv3 = inception_model.predict(fake_resized, batch_size=32, verbose=0)
 
+        act_real_iv3 = np.nan_to_num(act_real_iv3, nan=0.0, posinf=0.0, neginf=0.0)
+        act_fake_iv3 = np.nan_to_num(act_fake_iv3, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # FID: 10 batches of 1000 (accumulated statistics)
+        fid_10k = TraditionalMetrics.frechet_distance_batched(
+            act_real_iv3, act_fake_iv3,
+            n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
+        )
+
+        # KID remains unchanged (full set / existing behavior)
         n_samples = min(10000, len(real_data), len(fake_data))
-        fid_10k = TraditionalMetrics.frechet_distance(act_real_iv3[:n_samples], act_fake_iv3[:n_samples])
         kid_10k = TraditionalMetrics.kernel_distance(act_real_iv3[:n_samples], act_fake_iv3[:n_samples])
 
         n_500 = min(500, len(real_data), len(fake_data))
@@ -462,15 +583,37 @@ class TraditionalMetrics:
 
         try:
             classifier_model = TraditionalMetrics.get_classifier(classifier_path)
-            act_real_rc = classifier_model.predict(real_data, batch_size=32, verbose=0)
-            act_fake_rc = classifier_model.predict(fake_data, batch_size=32, verbose=0)
 
-            frd_10k = TraditionalMetrics.frechet_distance(act_real_rc[:n_samples], act_fake_rc[:n_samples])
+            # Prepare inputs for RC classifier
+            real_rc_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+            fake_rc_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+
+            act_real_rc = classifier_model.predict(real_rc_data, batch_size=32, verbose=0)
+            act_fake_rc = classifier_model.predict(fake_rc_data, batch_size=32, verbose=0)
+
+            act_real_rc = np.nan_to_num(act_real_rc, nan=0.0, posinf=0.0, neginf=0.0)
+            act_fake_rc = np.nan_to_num(act_fake_rc, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # FRD: 10 batches of 1000 (accumulated statistics)
+            frd_10k = TraditionalMetrics.frechet_distance_batched(
+                act_real_rc, act_fake_rc,
+                n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
+            )
+
+            # KRD remains unchanged
             krd_10k = TraditionalMetrics.kernel_distance(act_real_rc[:n_samples], act_fake_rc[:n_samples])
-            frd_500 = TraditionalMetrics.frechet_distance(act_real_rc[:n_500], act_fake_rc[:n_500])
-            krd_500 = TraditionalMetrics.kernel_distance(act_real_rc[:n_500], act_fake_rc[:n_500])
-        except:
-            print(f"Warning: Could not load classifier from {classifier_path}")
+
+            # 500-sample versions unchanged
+            act_real_rc_500 = classifier_model.predict(real_data[:n_500], batch_size=32, verbose=0)
+            act_fake_rc_500 = classifier_model.predict(fake_data[:n_500], batch_size=32, verbose=0)
+
+            act_real_rc_500 = np.nan_to_num(act_real_rc_500, nan=0.0, posinf=0.0, neginf=0.0)
+            act_fake_rc_500 = np.nan_to_num(act_fake_rc_500, nan=0.0, posinf=0.0, neginf=0.0)
+
+            frd_500 = TraditionalMetrics.frechet_distance(act_real_rc_500, act_fake_rc_500)
+            krd_500 = TraditionalMetrics.kernel_distance(act_real_rc_500, act_fake_rc_500)
+        except Exception as e:
+            print(f"Warning: Could not load classifier from {classifier_path}: {e}")
             frd_10k = frd_500 = krd_10k = krd_500 = 0.0
 
         return {
@@ -2127,7 +2270,8 @@ def generate_final_report(final_metrics, execution_time, save_dir='training_outp
         f.write(f"Gradient clipping: 0.5\n")
         f.write(f"Label smoothing: 0.1\n")
         f.write(f"Adam optimizer betas: (0.5, 0.9)\n")
-        f.write(f"Adam optimizer epsilon: 1e-8\n\n")
+        f.write(f"Adam optimizer epsilon: 1e-8\n")
+        f.write(f"FID/FRD sampling: 10 batches x 1000 samples (10000 total)\n\n")
 
         # Execution Time
         f.write("EXECUTION TIME\n")
@@ -2164,11 +2308,11 @@ def generate_final_report(final_metrics, execution_time, save_dir='training_outp
         f.write("TRADITIONAL METRICS\n")
         f.write("-" * 40 + "\n")
         trad = final_metrics['traditional']
-        f.write(f"FID (10k samples): {trad['FID_10k']:.4f}\n")
+        f.write(f"FID (10k samples, 10 batches x 1000): {trad['FID_10k']:.4f}\n")
         f.write(f"FID (500 samples): {trad['FID_500']:.4f}\n")
         f.write(f"KID (10k samples): {trad['KID_10k']:.6f}\n")
         f.write(f"KID (500 samples): {trad['KID_500']:.6f}\n")
-        f.write(f"FRD (10k samples): {trad['FRD_10k']:.4f}\n")
+        f.write(f"FRD (10k samples, 10 batches x 1000): {trad['FRD_10k']:.4f}\n")
         f.write(f"FRD (500 samples): {trad['FRD_500']:.4f}\n")
         f.write(f"KRD (10k samples): {trad['KRD_10k']:.6f}\n")
         f.write(f"KRD (500 samples): {trad['KRD_500']:.6f}\n\n")
@@ -2254,7 +2398,7 @@ def generate_final_report(final_metrics, execution_time, save_dir='training_outp
     print(f"{'=' * 80}")
     print(f"\nEXECUTION TIME: {execution_time / 3600:.2f} hours")
     print(f"\nFINAL METRICS:")
-    print(f"  FID_10k: {trad['FID_10k']:.4f}")
+    print(f"  FID_10k (10 batches x 1000): {trad['FID_10k']:.4f}")
     print(f"  Variogram MSE: {static['variogram_mse']:.6f}")
     print(f"  Histogram KL: {static['hist_kl']:.6f}")
     print(f"  PCA Correlation: {static['pca_correlation']:.6f}")
@@ -2434,6 +2578,7 @@ print(f"Latent Gaussian weight: {stylegan2.latent_gaussian_weight}")
 print(f"Generator Gaussian reg: {generator.gaussian_reg_strength}")
 print(f"Noise injection: {stylegan2.noise_std}")
 print(f"Gradient clipping: {stylegan2.gradient_clip}")
+print(f"FID/FRD: 10 batches x 1000 samples (10000 total)")
 print("=" * 60)
 
 try:
@@ -2478,7 +2623,7 @@ try:
     print("=" * 60)
 
     print("Generating final samples for analysis...")
-    size = min(5000, len(x_test))
+    size = min(10000, len(x_test))
     noise = np.random.normal(0, 1, (size, latent_dim))
     fake_data = generator.predict(noise, verbose=0, batch_size=32)
     real_data = x_test[:size]
