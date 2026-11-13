@@ -11,7 +11,6 @@ from sklearn.manifold import MDS
 from scipy.spatial.distance import pdist, squareform, cdist
 import gc
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
 import psutil
 from scipy.stats import entropy, norm, kstest
 from sklearn.metrics import pairwise_kernels
@@ -20,6 +19,20 @@ from scipy.stats import gaussian_kde
 import pickle
 import time
 from PIL import Image
+import gc
+from tensorflow.keras import backend as K
+from tensorflow.keras.callbacks import Callback
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+from metrics import *
+
+
+
+
+class ClearMemoryCallback(Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        gc.collect()
+        K.clear_session()
 
 
 plt.rcParams.update({
@@ -44,13 +57,13 @@ if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"GPUs disponíveis: {len(gpus)}")
+        print(f"Available GPUs: {len(gpus)}")
     except RuntimeError as e:
         print(e)
 
 # Configuration parameters
 zdim = 512
-epochs = 300
+epochs = 150
 metric_interval = 10
 batch_size = 64
 lr = 0.0002
@@ -92,7 +105,7 @@ x_train = X_train[:train_size]
 x_test = X_train[train_size:]
 
 latent_dim = zdim
-w_dim = zdim * 2  # Dimensão do espaço W (após mapping network)
+w_dim = zdim * 2  # Dimension of the W space (after mapping network)
 
 
 class MemoryOptimizer:
@@ -366,7 +379,26 @@ class TraditionalMetrics:
 
     @staticmethod
     def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+        # ------------------------------------------------------------------
+        # FID FIX:
+        # Adds an epsilon regularizer to the diagonal of the covariance
+        # matrices before computing the matrix square root. This is the
+        # standard practice (official TensorFlow FID / original FID paper) and
+        # prevents sqrtm from producing huge NaN/Inf/complex values when
+        # the covariance matrices are ill-conditioned.
+        # ------------------------------------------------------------------
+        mu1 = np.atleast_1d(mu1).astype(np.float64)
+        mu2 = np.atleast_1d(mu2).astype(np.float64)
+        sigma1 = np.atleast_2d(sigma1).astype(np.float64)
+        sigma2 = np.atleast_2d(sigma2).astype(np.float64)
+
         diff = mu1 - mu2
+
+        # Numerical regularization: ensures dominant diagonal
+        sigma1 = sigma1 + np.eye(sigma1.shape[0]) * eps
+        sigma2 = sigma2 + np.eye(sigma2.shape[0]) * eps
+
+        # Computes sqrtm of the product with non-finite handling
         covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
 
         if not np.isfinite(covmean).all():
@@ -374,10 +406,15 @@ class TraditionalMetrics:
             covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
 
         if np.iscomplexobj(covmean):
+            if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+                m = np.max(np.abs(covmean.imag))
+                raise ValueError(f"Imaginary component {m}")
             covmean = covmean.real
 
-        fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
-        return fid
+        tr_covmean = np.trace(covmean)
+
+        fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2.0 * tr_covmean
+        return float(fid)
 
     @staticmethod
     def frechet_distance(real_features, fake_features):
@@ -386,6 +423,52 @@ class TraditionalMetrics:
 
         fid_value = TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
         return fid_value
+
+    @staticmethod
+    def frechet_distance_batched(real_features, fake_features, n_batches=10, batch_size=1000):
+        """
+        Computes the Frechet Distance using batched computation over 10 batches of 1000 samples.
+        Accumulates the statistics (mean and covariance) incrementally between batches.
+        """
+        real_features = np.asarray(real_features, dtype=np.float64)
+        fake_features = np.asarray(fake_features, dtype=np.float64)
+
+        # Accumulate statistics for the real features
+        real_sum = np.zeros(real_features.shape[1], dtype=np.float64)
+        real_sum_sq = np.zeros((real_features.shape[1], real_features.shape[1]), dtype=np.float64)
+        real_count = 0
+
+        for i in range(n_batches):
+            start = i * batch_size
+            end = start + batch_size
+            batch = real_features[start:end]
+            real_sum += batch.sum(axis=0)
+            real_sum_sq += batch.T @ batch
+            real_count += batch.shape[0]
+
+        mu1 = real_sum / real_count
+        sigma1 = (real_sum_sq / real_count) - np.outer(mu1, mu1)
+
+        # Accumulate statistics for the generated features
+        fake_sum = np.zeros(fake_features.shape[1], dtype=np.float64)
+        fake_sum_sq = np.zeros((fake_features.shape[1], fake_features.shape[1]), dtype=np.float64)
+        fake_count = 0
+
+        for i in range(n_batches):
+            start = i * batch_size
+            end = start + batch_size
+            batch = fake_features[start:end]
+            fake_sum += batch.sum(axis=0)
+            fake_sum_sq += batch.T @ batch
+            fake_count += batch.shape[0]
+
+        mu2 = fake_sum / fake_count
+        sigma2 = (fake_sum_sq / fake_count) - np.outer(mu2, mu2)
+
+        if sigma1.ndim == 0: sigma1 = np.array([[sigma1]])
+        if sigma2.ndim == 0: sigma2 = np.array([[sigma2]])
+
+        return TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
 
     @staticmethod
     def kernel_distance(real_features, fake_features, num_blocks=100, max_block_size=1000):
@@ -412,17 +495,49 @@ class TraditionalMetrics:
 
     @staticmethod
     def compute_all_traditional_metrics(real_data, fake_data, classifier_path='Reservoir_classifier.h5'):
+        """Computes all traditional metrics.
+
+        FID and FRD are computed with 10000 samples split into 10 batches of 1000,
+        accumulating the statistics (mean and covariance) incrementally.
+        """
         print("Calculating traditional metrics...")
 
-        real_resized = tf.image.resize(np.repeat(real_data, 3, axis=3), [75, 75])
-        fake_resized = tf.image.resize(np.repeat(fake_data, 3, axis=3), [75, 75])
+        # Ensure exactly 10000 samples for batched FID/FRD (10 batches x 1000)
+        FID_N_BATCHES = 10
+        FID_BATCH_SIZE = 1000
+        FID_TOTAL = FID_N_BATCHES * FID_BATCH_SIZE  # 10000
+
+        n_available = min(len(real_data), len(fake_data))
+        n_fid = min(FID_TOTAL, n_available)
+
+        # If fewer than 10000 samples available, adjust batch size
+        if n_fid < FID_TOTAL:
+            FID_N_BATCHES = max(1, n_fid // FID_BATCH_SIZE)
+            if FID_N_BATCHES == 0:
+                FID_N_BATCHES = 1
+                FID_BATCH_SIZE = n_fid
+            else:
+                FID_BATCH_SIZE = n_fid // FID_N_BATCHES
+
+        real_fid_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+        fake_fid_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+
+        # Prepare inputs for InceptionV3 (75x75x3)
+        real_resized = tf.image.resize(np.repeat(real_fid_data, 3, axis=3), [75, 75])
+        fake_resized = tf.image.resize(np.repeat(fake_fid_data, 3, axis=3), [75, 75])
 
         inception_model = TraditionalMetrics.get_inception((75, 75, 3))
         act_real_iv3 = inception_model.predict(real_resized, batch_size=32, verbose=0)
         act_fake_iv3 = inception_model.predict(fake_resized, batch_size=32, verbose=0)
 
+        # FID: 10 batches of 1000 (accumulated statistics)
+        fid_10k = TraditionalMetrics.frechet_distance_batched(
+            act_real_iv3, act_fake_iv3,
+            n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
+        )
+
+        # KID remains unchanged (full set / existing behavior)
         n_samples = min(10000, len(real_data), len(fake_data))
-        fid_10k = TraditionalMetrics.frechet_distance(act_real_iv3[:n_samples], act_fake_iv3[:n_samples])
         kid_10k = TraditionalMetrics.kernel_distance(act_real_iv3[:n_samples], act_fake_iv3[:n_samples])
 
         n_500 = min(500, len(real_data), len(fake_data))
@@ -431,15 +546,31 @@ class TraditionalMetrics:
 
         try:
             classifier_model = TraditionalMetrics.get_classifier(classifier_path)
-            act_real_rc = classifier_model.predict(real_data, batch_size=32, verbose=0)
-            act_fake_rc = classifier_model.predict(fake_data, batch_size=32, verbose=0)
 
-            frd_10k = TraditionalMetrics.frechet_distance(act_real_rc[:n_samples], act_fake_rc[:n_samples])
+            # Prepare inputs for the RC classifier
+            real_rc_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+            fake_rc_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+
+            act_real_rc = classifier_model.predict(real_rc_data, batch_size=32, verbose=0)
+            act_fake_rc = classifier_model.predict(fake_rc_data, batch_size=32, verbose=0)
+
+            # FRD: 10 batches of 1000 (accumulated statistics)
+            frd_10k = TraditionalMetrics.frechet_distance_batched(
+                act_real_rc, act_fake_rc,
+                n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
+            )
+
+            # KRD remains unchanged
             krd_10k = TraditionalMetrics.kernel_distance(act_real_rc[:n_samples], act_fake_rc[:n_samples])
-            frd_500 = TraditionalMetrics.frechet_distance(act_real_rc[:n_500], act_fake_rc[:n_500])
-            krd_500 = TraditionalMetrics.kernel_distance(act_real_rc[:n_500], act_fake_rc[:n_500])
-        except:
-            print(f"Warning: Could not load classifier from {classifier_path}")
+
+            # 500-sample versions unchanged
+            act_real_rc_500 = classifier_model.predict(real_data[:n_500], batch_size=32, verbose=0)
+            act_fake_rc_500 = classifier_model.predict(fake_data[:n_500], batch_size=32, verbose=0)
+
+            frd_500 = TraditionalMetrics.frechet_distance(act_real_rc_500, act_fake_rc_500)
+            krd_500 = TraditionalMetrics.kernel_distance(act_real_rc_500, act_fake_rc_500)
+        except Exception as e:
+            print(f"Warning: Could not load classifier from {classifier_path}: {e}")
             frd_10k = frd_500 = krd_10k = krd_500 = 0.0
 
         return {
@@ -744,11 +875,9 @@ class GaussianStabilizedGenerator(tf.keras.Model):
         ])
 
     def map_to_w(self, z_vectors):
-
         return self.mapping(z_vectors)
 
     def generate_from_w(self, w_vectors, training=False):
-
         batch_size = tf.shape(w_vectors)[0]
         x = tf.tile(self.constant, [batch_size, 1, 1, 1])
 
@@ -763,11 +892,9 @@ class GaussianStabilizedGenerator(tf.keras.Model):
         return x
 
     def call(self, inputs, training=False):
-
         input_dim = inputs.shape[-1]
 
         if input_dim == self.latent_dim:
-
             if training:
                 inputs_mean = tf.reduce_mean(inputs, axis=0, keepdims=True)
                 inputs_std = tf.math.reduce_std(inputs, axis=0, keepdims=True) + 1e-8
@@ -775,7 +902,6 @@ class GaussianStabilizedGenerator(tf.keras.Model):
             w = self.map_to_w(inputs)
             return self.generate_from_w(w, training=training)
         elif input_dim == self.w_dim:
-
             return self.generate_from_w(inputs, training=training)
         else:
             raise ValueError(f"Expected input dim {self.latent_dim} (Z) or {self.w_dim} (W), got {input_dim}")
@@ -796,7 +922,7 @@ class GaussianStabilizedGenerator(tf.keras.Model):
 
 
 class FeatureExtractingDiscriminator(tf.keras.Model):
-    """StyleGAN2 Discriminator com feature extraction."""
+    """StyleGAN2 Discriminator with feature extraction."""
 
     def __init__(self, img_shape=(48, 48, 1), n_filters=64, **kwargs):
         super().__init__(**kwargs)
@@ -960,7 +1086,6 @@ class StyleGAN2(keras.Model):
         return images + noise
 
     def compute_latent_gaussian_loss(self, z_vectors):
-
         mean = tf.reduce_mean(z_vectors, axis=0)
         variance = tf.math.reduce_variance(z_vectors, axis=0)
 
@@ -986,17 +1111,13 @@ class StyleGAN2(keras.Model):
         return gaussian_loss
 
     def compute_w_consistency_loss(self, z_vectors):
-
         w_vectors = self.generator.map_to_w(z_vectors)
-
 
         w_mean = tf.reduce_mean(w_vectors, axis=0)
         w_std = tf.math.reduce_std(w_vectors, axis=0)
 
-
         w_mean_loss = tf.reduce_mean(tf.square(w_mean))
         w_std_loss = tf.reduce_mean(tf.square(w_std - 1.0))
-
 
         batch_size = tf.shape(w_vectors)[0]
         half_batch = batch_size // 2
@@ -1123,7 +1244,6 @@ class StyleGAN2(keras.Model):
         }
 
     def call(self, inputs, training=False):
-
         return self.generator(inputs, training=training)
 
     def get_config(self):
@@ -1141,7 +1261,7 @@ class StyleGAN2(keras.Model):
     @classmethod
     def from_config(cls, config):
         raise ValueError(
-            "StyleGAN2 não pode ser carregado diretamente de config. "
+            "StyleGAN2 cannot be loaded directly from config. "
             "Use: StyleGAN2(generator, discriminator, **config)"
         )
 
@@ -1193,7 +1313,6 @@ class StyleGAN2(keras.Model):
             json.dump(config, f, indent=4, default=str)
         print(f"   ✓ Configuration saved to: {os.path.join(save_dir, 'model_config_w.json')}")
 
-
         with open(os.path.join(save_dir, 'w_dim.txt'), 'w') as f:
             f.write(str(self.w_dim))
         print(f"   ✓ W dimension ({self.w_dim}) saved to: {os.path.join(save_dir, 'w_dim.txt')}")
@@ -1207,6 +1326,7 @@ class StyleGAN2(keras.Model):
 
 
 class SampleSaverCallback(tf.keras.callbacks.Callback):
+    """Callback to save samples and latent space analysis."""
 
     def __init__(self, generator, latent_dim, save_dir='training_outputs/samples',
                  latent_analysis_interval=50):
@@ -1255,6 +1375,7 @@ class SampleSaverCallback(tf.keras.callbacks.Callback):
 
 
 class EnhancedMetricCallback(tf.keras.callbacks.Callback):
+    """Enhanced callback to compute all metrics every 10 epochs."""
 
     def __init__(self, generator, x_test, latent_dim, metric_interval=10,
                  log_file='training_metrics.txt', save_dir='training_outputs/metrics'):
@@ -1511,6 +1632,7 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
 
 
 class ImprovedStabilizationCallback(tf.keras.callbacks.Callback):
+    """Improved callback to stabilize training."""
 
     def __init__(self, threshold_ratio=0.8):
         super().__init__()
@@ -1569,6 +1691,7 @@ class ImprovedStabilizationCallback(tf.keras.callbacks.Callback):
 
 
 class AdaptiveLearningRateScheduler(tf.keras.callbacks.Callback):
+    """Adaptive learning rate scheduler based on metrics."""
 
     def __init__(self, initial_lr_g=0.0001, initial_lr_d=0.0004):
         super().__init__()
@@ -2157,7 +2280,8 @@ def generate_final_report(all_metrics, execution_time, save_path='training_outpu
         f.write(f"Latent Gaussian weight: 0.1\n")
         f.write(f"W consistency weight: 0.05\n")
         f.write(f"Generator Gaussian reg: 0.01\n")
-        f.write(f"Metric interval: {metric_interval}\n\n")
+        f.write(f"Metric interval: {metric_interval}\n")
+        f.write(f"FID/FRD sampling: 10 batches x 1000 samples (10000 total)\n\n")
 
         f.write("2. W-SPACE INFORMATION\n")
         f.write("-" * 40 + "\n")
@@ -2399,6 +2523,7 @@ print(f"Z dimension: {latent_dim}")
 print(f"W dimension: {w_dim}")
 print(f"Batch size: {batch_size}")
 print(f"Learning rates: G=0.0001, D=0.0004")
+print(f"FID/FRD: 10 batches x 1000 samples (10000 total)")
 print("=" * 60)
 
 try:
@@ -2444,7 +2569,7 @@ try:
     print("=" * 60)
 
     print("Generating final samples...")
-    size = min(5000, len(x_test))
+    size = min(10000, len(x_test))
     noise = np.random.normal(0, 1, (size, latent_dim))
     fake_data = generator.predict(noise, verbose=0, batch_size=32)
     real_data = x_test[:size]
@@ -2467,7 +2592,7 @@ try:
         save_dir='training_outputs/latent_analysis'
     )
 
-    # Consolidar métricas
+    # Consolidate metrics
     final_metrics = {
         'traditional': final_traditional_metrics,
         'static': final_static_metrics,
