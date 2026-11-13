@@ -23,7 +23,7 @@ from PIL import Image
 import json
 
 # ============================================
-# CONFIGURAÇÃO DE FONTES GLOBAIS
+# GLOBAL FONT CONFIGURATION
 # ============================================
 
 plt.rcParams.update({
@@ -40,7 +40,7 @@ plt.rcParams.update({
 })
 
 # ============================================
-# LIMPEZA COMPLETA E INICIALIZAÇÃO
+# COMPLETE CLEANUP AND INITIALIZATION
 # ============================================
 
 tf.keras.backend.clear_session()
@@ -51,7 +51,7 @@ if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"GPUs disponíveis: {len(gpus)}")
+        print(f"GPUs available: {len(gpus)}")
     except RuntimeError as e:
         print(e)
 
@@ -60,8 +60,8 @@ zdim = 512
 epochs = 500
 metric_interval = 10
 batch_size = 64
-lr = 0.0002
-beta = 0.05
+lr = 0.001
+beta = 1
 d_reg = 5
 name = 'unisim_ii_cropped'
 
@@ -103,7 +103,7 @@ x_train = X_train[:train_size]
 x_test = X_train[train_size:]
 
 latent_dim = zdim
-w_dim = zdim * 2  # Dimensão do espaço W (após mapping network)
+w_dim = zdim * 2  # W space dimension (after mapping network)
 
 
 class MemoryOptimizer:
@@ -378,25 +378,110 @@ class TraditionalMetrics:
     @staticmethod
     def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
         diff = mu1 - mu2
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+        d = sigma1.shape[0]
 
-        if not np.isfinite(covmean).all():
-            offset = np.eye(sigma1.shape[0]) * eps
-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+        reg1 = eps * max(np.trace(sigma1) / max(d, 1), 1.0)
+        reg2 = eps * max(np.trace(sigma2) / max(d, 1), 1.0)
+        sigma1 = sigma1 + np.eye(d) * reg1
+        sigma2 = sigma2 + np.eye(d) * reg2
 
-        if np.iscomplexobj(covmean):
-            covmean = covmean.real
+        try:
+            result = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+            covmean = result[0] if isinstance(result, tuple) else result
+            if np.iscomplexobj(covmean):
+                covmean = covmean.real
+            covmean = np.nan_to_num(covmean, nan=0.0, posinf=0.0, neginf=0.0)
+            if not np.all(np.isfinite(covmean)):
+                raise ValueError("covmean non-finite")
+            tr_covmean = np.trace(covmean)
+        except Exception:
+            diag1 = np.diag(sigma1)
+            diag2 = np.diag(sigma2)
+            tr_covmean = np.sum(np.sqrt(np.maximum(diag1 * diag2, 0.0)))
 
-        fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
-        return fid
+        fid = float(diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2.0 * tr_covmean)
+
+        if not np.isfinite(fid):
+            return 1e6
+        return max(fid, 0.0)
 
     @staticmethod
     def frechet_distance(real_features, fake_features):
-        mu1, sigma1 = np.mean(real_features, axis=0), np.cov(real_features, rowvar=False)
-        mu2, sigma2 = np.mean(fake_features, axis=0), np.cov(fake_features, rowvar=False)
+        real_features = np.asarray(real_features, dtype=np.float64)
+        fake_features = np.asarray(fake_features, dtype=np.float64)
 
-        fid_value = TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-        return fid_value
+        real_features = np.nan_to_num(real_features, nan=0.0, posinf=0.0, neginf=0.0)
+        fake_features = np.nan_to_num(fake_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        n1, d = real_features.shape
+        n2, _ = fake_features.shape
+
+        if n1 < 3 * d or n2 < 3 * d:
+            target_dims = max(32, min(min(n1, n2) // 3, d))
+            if target_dims < d:
+                pca = PCA(n_components=target_dims)
+                pca.fit(np.vstack([real_features, fake_features]))
+                real_features = pca.transform(real_features)
+                fake_features = pca.transform(fake_features)
+
+        mu1 = real_features.mean(axis=0)
+        sigma1 = np.cov(real_features, rowvar=False)
+        mu2 = fake_features.mean(axis=0)
+        sigma2 = np.cov(fake_features, rowvar=False)
+
+        if sigma1.ndim == 0: sigma1 = np.array([[sigma1]])
+        if sigma2.ndim == 0: sigma2 = np.array([[sigma2]])
+
+        return TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+
+    @staticmethod
+    def frechet_distance_batched(real_features, fake_features, n_batches=10, batch_size=1000):
+        """
+        Computes the Frechet Distance using batched computation over 10 batches of 1000 samples.
+        Accumulates the statistics (mean and covariance) incrementally between batches.
+        """
+        real_features = np.asarray(real_features, dtype=np.float64)
+        fake_features = np.asarray(fake_features, dtype=np.float64)
+
+        real_features = np.nan_to_num(real_features, nan=0.0, posinf=0.0, neginf=0.0)
+        fake_features = np.nan_to_num(fake_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Accumulate statistics for real features
+        real_sum = np.zeros(real_features.shape[1], dtype=np.float64)
+        real_sum_sq = np.zeros((real_features.shape[1], real_features.shape[1]), dtype=np.float64)
+        real_count = 0
+
+        for i in range(n_batches):
+            start = i * batch_size
+            end = start + batch_size
+            batch = real_features[start:end]
+            real_sum += batch.sum(axis=0)
+            real_sum_sq += batch.T @ batch
+            real_count += batch.shape[0]
+
+        mu1 = real_sum / real_count
+        sigma1 = (real_sum_sq / real_count) - np.outer(mu1, mu1)
+
+        # Accumulate statistics for fake features
+        fake_sum = np.zeros(fake_features.shape[1], dtype=np.float64)
+        fake_sum_sq = np.zeros((fake_features.shape[1], fake_features.shape[1]), dtype=np.float64)
+        fake_count = 0
+
+        for i in range(n_batches):
+            start = i * batch_size
+            end = start + batch_size
+            batch = fake_features[start:end]
+            fake_sum += batch.sum(axis=0)
+            fake_sum_sq += batch.T @ batch
+            fake_count += batch.shape[0]
+
+        mu2 = fake_sum / fake_count
+        sigma2 = (fake_sum_sq / fake_count) - np.outer(mu2, mu2)
+
+        if sigma1.ndim == 0: sigma1 = np.array([[sigma1]])
+        if sigma2.ndim == 0: sigma2 = np.array([[sigma2]])
+
+        return TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
 
     @staticmethod
     def kernel_distance(real_features, fake_features, num_blocks=100, max_block_size=1000):
@@ -423,17 +508,52 @@ class TraditionalMetrics:
 
     @staticmethod
     def compute_all_traditional_metrics(real_data, fake_data, classifier_path='Reservoir_classifier.h5'):
+        """Computes all traditional metrics.
+
+        FID and FRD are computed with 10000 samples split into 10 batches of 1000,
+        accumulating the statistics (mean and covariance) incrementally.
+        """
         print("Calculating traditional metrics...")
 
-        real_resized = tf.image.resize(np.repeat(real_data, 3, axis=3), [75, 75])
-        fake_resized = tf.image.resize(np.repeat(fake_data, 3, axis=3), [75, 75])
+        # Ensure exactly 10000 samples for batched FID/FRD (10 batches x 1000)
+        FID_N_BATCHES = 10
+        FID_BATCH_SIZE = 1000
+        FID_TOTAL = FID_N_BATCHES * FID_BATCH_SIZE  # 10000
+
+        n_available = min(len(real_data), len(fake_data))
+        n_fid = min(FID_TOTAL, n_available)
+
+        # If fewer than 10000 samples available, adjust batch size
+        if n_fid < FID_TOTAL:
+            FID_N_BATCHES = max(1, n_fid // FID_BATCH_SIZE)
+            if FID_N_BATCHES == 0:
+                FID_N_BATCHES = 1
+                FID_BATCH_SIZE = n_fid
+            else:
+                FID_BATCH_SIZE = n_fid // FID_N_BATCHES
+
+        real_fid_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+        fake_fid_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+
+        # Prepare inputs for InceptionV3 (75x75x3)
+        real_resized = tf.image.resize(np.repeat(real_fid_data, 3, axis=3), [75, 75])
+        fake_resized = tf.image.resize(np.repeat(fake_fid_data, 3, axis=3), [75, 75])
 
         inception_model = TraditionalMetrics.get_inception((75, 75, 3))
         act_real_iv3 = inception_model.predict(real_resized, batch_size=32, verbose=0)
         act_fake_iv3 = inception_model.predict(fake_resized, batch_size=32, verbose=0)
 
+        act_real_iv3 = np.nan_to_num(act_real_iv3, nan=0.0, posinf=0.0, neginf=0.0)
+        act_fake_iv3 = np.nan_to_num(act_fake_iv3, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # FID: 10 batches of 1000 (accumulated statistics)
+        fid_10k = TraditionalMetrics.frechet_distance_batched(
+            act_real_iv3, act_fake_iv3,
+            n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
+        )
+
+        # KID remains unchanged (full set / existing behavior)
         n_samples = min(10000, len(real_data), len(fake_data))
-        fid_10k = TraditionalMetrics.frechet_distance(act_real_iv3[:n_samples], act_fake_iv3[:n_samples])
         kid_10k = TraditionalMetrics.kernel_distance(act_real_iv3[:n_samples], act_fake_iv3[:n_samples])
 
         n_500 = min(500, len(real_data), len(fake_data))
@@ -442,15 +562,37 @@ class TraditionalMetrics:
 
         try:
             classifier_model = TraditionalMetrics.get_classifier(classifier_path)
-            act_real_rc = classifier_model.predict(real_data, batch_size=32, verbose=0)
-            act_fake_rc = classifier_model.predict(fake_data, batch_size=32, verbose=0)
 
-            frd_10k = TraditionalMetrics.frechet_distance(act_real_rc[:n_samples], act_fake_rc[:n_samples])
+            # Prepare inputs for the RC classifier
+            real_rc_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+            fake_rc_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+
+            act_real_rc = classifier_model.predict(real_rc_data, batch_size=32, verbose=0)
+            act_fake_rc = classifier_model.predict(fake_rc_data, batch_size=32, verbose=0)
+
+            act_real_rc = np.nan_to_num(act_real_rc, nan=0.0, posinf=0.0, neginf=0.0)
+            act_fake_rc = np.nan_to_num(act_fake_rc, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # FRD: 10 batches of 1000 (accumulated statistics)
+            frd_10k = TraditionalMetrics.frechet_distance_batched(
+                act_real_rc, act_fake_rc,
+                n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
+            )
+
+            # KRD remains unchanged
             krd_10k = TraditionalMetrics.kernel_distance(act_real_rc[:n_samples], act_fake_rc[:n_samples])
-            frd_500 = TraditionalMetrics.frechet_distance(act_real_rc[:n_500], act_fake_rc[:n_500])
-            krd_500 = TraditionalMetrics.kernel_distance(act_real_rc[:n_500], act_fake_rc[:n_500])
-        except:
-            print(f"Warning: Could not load classifier from {classifier_path}")
+
+            # 500-sample versions unchanged
+            act_real_rc_500 = classifier_model.predict(real_data[:n_500], batch_size=32, verbose=0)
+            act_fake_rc_500 = classifier_model.predict(fake_data[:n_500], batch_size=32, verbose=0)
+
+            act_real_rc_500 = np.nan_to_num(act_real_rc_500, nan=0.0, posinf=0.0, neginf=0.0)
+            act_fake_rc_500 = np.nan_to_num(act_fake_rc_500, nan=0.0, posinf=0.0, neginf=0.0)
+
+            frd_500 = TraditionalMetrics.frechet_distance(act_real_rc_500, act_fake_rc_500)
+            krd_500 = TraditionalMetrics.kernel_distance(act_real_rc_500, act_fake_rc_500)
+        except Exception as e:
+            print(f"Warning: Could not load classifier from {classifier_path}: {e}")
             frd_10k = frd_500 = krd_10k = krd_500 = 0.0
 
         return {
@@ -603,11 +745,11 @@ class GaussianLatentValidator:
 
 
 # ============================================
-# ARQUITETURA MELHORADA: CÓDIGO 2 + TODAS AS MELHORIAS DO CÓDIGO 1
+# IMPROVED ARCHITECTURE: CODE 2 + ALL IMPROVEMENTS FROM CODE 1
 # ============================================
 
 class GaussianRegularizedAdaIN(layers.Layer):
-    """AdaIN com regularização Gaussiana - DO PRIMEIRO CÓDIGO"""
+    """AdaIN with Gaussian regularization - FROM THE FIRST CODE"""
 
     def __init__(self, channels, gaussian_reg_weight=0.1, **kwargs):
         super().__init__(**kwargs)
@@ -626,7 +768,7 @@ class GaussianRegularizedAdaIN(layers.Layer):
         x, w = inputs
 
         if training:
-            # Perda KL para manter W próximo de uma Gaussiana
+            # KL loss to keep W close to a Gaussian
             w_mean = tf.reduce_mean(w, axis=0)
             w_std = tf.math.reduce_std(w, axis=0)
 
@@ -662,7 +804,7 @@ class GaussianRegularizedAdaIN(layers.Layer):
 
 
 class ImprovedWSpaceGenerator(tf.keras.Model):
-    """Gerador melhorado: Arquitetura do código 2 + todas as melhorias do código 1"""
+    """Improved generator: Architecture from code 2 + all improvements from code 1"""
 
     def __init__(self, latent_dim=512, img_shape=(48, 48, 1), n_filters=64,
                  gaussian_reg_strength=0.01, **kwargs):
@@ -673,24 +815,24 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
         self.n_filters = n_filters
         self.gaussian_reg_strength = gaussian_reg_strength
 
-        # Mapping network: Z -> W (mais profunda e com mais regularização)
+        # Mapping network: Z -> W (deeper and with more regularization)
         self.mapping = self._build_mapping_network()
 
-        # Normalização do espaço latente (DO PRIMEIRO CÓDIGO)
+        # Latent space normalization (FROM THE FIRST CODE)
         self.latent_normalization = layers.BatchNormalization(
             momentum=0.9, epsilon=1e-5, center=True, scale=True
         )
 
-        # Constant input aprendível
+        # Learnable constant input
         self.constant = tf.Variable(
             tf.random.normal([1, 4, 4, n_filters * 8], stddev=0.02),
             trainable=True
         )
 
-        # Blocos do gerador
+        # Generator blocks
         self._build_generator_blocks()
 
-        # Camada final
+        # Final layer
         self.to_rgb = layers.Conv2D(
             img_shape[2], 1, padding='same',
             kernel_initializer='he_normal',
@@ -699,7 +841,7 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
         )
 
     def _build_mapping_network(self):
-        """Mapping network mais profunda e regularizada (DO PRIMEIRO CÓDIGO)"""
+        """Deeper and regularized mapping network (FROM THE FIRST CODE)"""
         return tf.keras.Sequential([
             layers.Input(shape=(self.latent_dim,)),
             layers.Dense(self.latent_dim * 2,
@@ -718,10 +860,10 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
         ], name='mapping_network')
 
     def _build_generator_blocks(self):
-        """Blocos do gerador com GaussianRegularizedAdaIN (DO PRIMEIRO CÓDIGO)"""
+        """Generator blocks with GaussianRegularizedAdaIN (FROM THE FIRST CODE)"""
         self.blocks = []
 
-        # Bloco 1: 4x4 -> 4x4
+        # Block 1: 4x4 -> 4x4
         self.blocks.append([
             layers.Conv2D(self.n_filters * 8, 3, padding='same',
                           kernel_initializer='he_normal',
@@ -730,7 +872,7 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
             layers.LeakyReLU(0.2),
         ])
 
-        # Bloco 2: 4x4 -> 8x8
+        # Block 2: 4x4 -> 8x8
         self.blocks.append([
             layers.UpSampling2D(size=(2, 2), interpolation='bilinear'),
             layers.Conv2D(self.n_filters * 4, 3, padding='same',
@@ -740,7 +882,7 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
             layers.LeakyReLU(0.2),
         ])
 
-        # Bloco 3: 8x8 -> 16x16
+        # Block 3: 8x8 -> 16x16
         self.blocks.append([
             layers.UpSampling2D(size=(2, 2), interpolation='bilinear'),
             layers.Conv2D(self.n_filters * 2, 3, padding='same',
@@ -750,7 +892,7 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
             layers.LeakyReLU(0.2),
         ])
 
-        # Bloco 4: 16x16 -> 32x32
+        # Block 4: 16x16 -> 32x32
         self.blocks.append([
             layers.UpSampling2D(size=(2, 2), interpolation='bilinear'),
             layers.Conv2D(self.n_filters, 3, padding='same',
@@ -760,7 +902,7 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
             layers.LeakyReLU(0.2),
         ])
 
-        # Bloco 5: 32x32 -> 64x64 com cropping para 48x48
+        # Block 5: 32x32 -> 64x64 with cropping to 48x48
         self.blocks.append([
             layers.UpSampling2D(size=(2, 2), interpolation='bilinear'),
             layers.Conv2D(self.n_filters // 2, 3, padding='same',
@@ -772,11 +914,11 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
         ])
 
     def map_to_w(self, z_vectors):
-        """Mapeia Z -> W"""
+        """Maps Z -> W"""
         return self.mapping(z_vectors)
 
     def generate_from_w(self, w_vectors, training=False):
-        """Gera imagens a partir de W"""
+        """Generates images from W"""
         batch_size = tf.shape(w_vectors)[0]
         x = tf.tile(self.constant, [batch_size, 1, 1, 1])
 
@@ -791,24 +933,24 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
         return x
 
     def call(self, inputs, training=False):
-        """Gera imagens a partir de Z ou W"""
+        """Generates images from Z or W"""
         input_dim = inputs.shape[-1]
 
         if input_dim == self.latent_dim:
-            # Entrada Z: normalizar (DO PRIMEIRO CÓDIGO) e mapear para W
+            # Z input: normalize (FROM THE FIRST CODE) and map to W
             if training:
-                # Normalização do batch para forçar gaussianidade
+                # Batch normalization to force Gaussianity
                 inputs_mean = tf.reduce_mean(inputs, axis=0, keepdims=True)
                 inputs_std = tf.math.reduce_std(inputs, axis=0, keepdims=True) + 1e-8
                 inputs = (inputs - inputs_mean) / inputs_std
 
-            # Aplicar BatchNormalization adicional
+            # Apply additional BatchNormalization
             inputs = self.latent_normalization(inputs, training=training)
 
             w = self.map_to_w(inputs)
             return self.generate_from_w(w, training=training)
         elif input_dim == self.w_dim:
-            # Entrada já é W
+            # Input is already W
             return self.generate_from_w(inputs, training=training)
         else:
             raise ValueError(f"Expected input dim {self.latent_dim} (Z) or {self.w_dim} (W), got {input_dim}")
@@ -829,7 +971,7 @@ class ImprovedWSpaceGenerator(tf.keras.Model):
 
 
 class FeatureExtractingDiscriminator(tf.keras.Model):
-    """Discriminador com extração de features (mantido do código 2)"""
+    """Discriminator with feature extraction (kept from code 2)"""
 
     def __init__(self, img_shape=(48, 48, 1), n_filters=64, **kwargs):
         super().__init__(**kwargs)
@@ -941,7 +1083,7 @@ class FeatureExtractingDiscriminator(tf.keras.Model):
 
 
 class ImprovedStyleGAN2WithWSpace(keras.Model):
-    """StyleGAN2 melhorado com todas as características do código 1 + arquitetura do código 2"""
+    """Improved StyleGAN2 with all features from code 1 + architecture from code 2"""
 
     def __init__(self,
                  generator,
@@ -969,7 +1111,7 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
         self.w_consistency_weight = w_consistency_weight
         self.feature_matching_weight = feature_matching_weight
 
-        # Métricas expandidas
+        # Expanded metrics
         self.g_loss_metric = tf.keras.metrics.Mean(name="g_loss")
         self.d_loss_metric = tf.keras.metrics.Mean(name="d_loss")
         self.d_real_metric = tf.keras.metrics.Mean(name="d_real")
@@ -1000,14 +1142,14 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
         return images + noise
 
     def compute_latent_gaussian_loss(self, z_vectors):
-        """Perda de gaussianidade no espaço Z (DO PRIMEIRO CÓDIGO)"""
+        """Gaussianity loss in Z space (FROM THE FIRST CODE)"""
         mean = tf.reduce_mean(z_vectors, axis=0)
         variance = tf.math.reduce_variance(z_vectors, axis=0)
 
         mean_loss = tf.reduce_mean(tf.square(mean))
         variance_loss = tf.reduce_mean(tf.square(variance - 1.0))
 
-        # Momentos de ordem superior
+        # Higher-order moments
         centered = z_vectors - mean
         fourth_moment = tf.reduce_mean(centered ** 4, axis=0)
         kurtosis = fourth_moment / (variance ** 2 + 1e-8)
@@ -1027,7 +1169,7 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
         return gaussian_loss
 
     def compute_w_consistency_loss(self, z_vectors):
-        """Perda de consistência do espaço W (DO PRIMEIRO CÓDIGO)"""
+        """W-space consistency loss (FROM THE FIRST CODE)"""
         w_vectors = self.generator.map_to_w(z_vectors)
 
         batch_size = tf.shape(w_vectors)[0]
@@ -1048,7 +1190,7 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
 
         consistency_loss = tf.reduce_mean(tf.square(img_interp - img_blend))
 
-        # Penalizar desvios da gaussianidade em W também
+        # Also penalize deviations from Gaussianity in W
         w_mean = tf.reduce_mean(w_vectors, axis=0)
         w_std = tf.math.reduce_std(w_vectors, axis=0)
         w_gaussian_loss = tf.reduce_mean(tf.square(w_mean)) + tf.reduce_mean(tf.square(w_std - 1.0))
@@ -1061,7 +1203,7 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
 
         batch_size = tf.shape(real_images)[0]
 
-        # TREINAR DISCRIMINADOR (2x como no código 2)
+        # TRAIN DISCRIMINATOR (2x as in code 2)
         d_loss_total = 0
 
         for _ in range(2):
@@ -1090,7 +1232,7 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
                 gradient_norm = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=[1, 2, 3]))
                 gradient_penalty = tf.reduce_mean((gradient_norm - 1.0) ** 2)
 
-                # Loss do discriminador com regularização
+                # Discriminator loss with regularization
                 d_loss = d_loss_fake - d_loss_real + self.d_reg * gradient_penalty
                 d_loss += 0.001 * tf.reduce_sum(self.discriminator.losses)  # L2 regularization
 
@@ -1109,32 +1251,32 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
 
         d_loss_avg = d_loss_total / 2.0
 
-        # TREINAR GERADOR (com todas as perdas do código 1)
+        # TRAIN GENERATOR (with all losses from code 1)
         with tf.GradientTape() as tape:
             z_noise = tf.random.normal([batch_size, self.latent_dim], mean=0.0, stddev=1.0)
             fake_images = self.generator(z_noise, training=True)
 
             fake_output = self.discriminator(fake_images, training=False)
 
-            # Loss adversarial
+            # Adversarial loss
             g_loss = -tf.reduce_mean(fake_output)
 
-            # Perda de gaussianidade no espaço Z (DO PRIMEIRO CÓDIGO)
+            # Gaussianity loss in Z space (FROM THE FIRST CODE)
             latent_gaussian_loss = self.compute_latent_gaussian_loss(z_noise)
             g_loss += self.latent_gaussian_weight * latent_gaussian_loss
 
-            # Perda de consistência do espaço W (DO PRIMEIRO CÓDIGO)
+            # W-space consistency loss (FROM THE FIRST CODE)
             w_consistency_loss = self.compute_w_consistency_loss(z_noise)
             g_loss += self.w_consistency_weight * w_consistency_loss
 
-            # Feature matching loss (DO PRIMEIRO CÓDIGO)
+            # Feature matching loss (FROM THE FIRST CODE)
             if hasattr(self.discriminator, 'features') and self.discriminator.features is not None:
                 real_features = self.discriminator.features
                 fake_features = self.discriminator.get_features(fake_images)
                 feature_loss = tf.reduce_mean(tf.abs(real_features - fake_features))
                 g_loss += self.feature_matching_weight * feature_loss
 
-            # Regularização L2 do gerador
+            # Generator L2 regularization
             g_loss += 0.001 * tf.reduce_sum(self.generator.losses)
 
         g_gradients = tape.gradient(g_loss, self.generator.trainable_variables)
@@ -1151,7 +1293,7 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
 
         g_grad_norm = tf.linalg.global_norm(g_gradients)
 
-        # Atualizar métricas
+        # Update metrics
         self.g_loss_metric.update_state(g_loss)
         self.d_loss_metric.update_state(d_loss_avg)
         self.d_real_metric.update_state(tf.reduce_mean(real_output))
@@ -1190,37 +1332,37 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
     @classmethod
     def from_config(cls, config):
         raise ValueError(
-            "ImprovedStyleGAN2WithWSpace cannot be charged. "
+            "ImprovedStyleGAN2WithWSpace cannot be loaded directly from config. "
             "Use: ImprovedStyleGAN2WithWSpace(generator, discriminator, **config)"
         )
 
     def save_all_models_weights(self, save_dir='training_outputs/final_models'):
-        """Salva todos os pesos e configurações"""
+        """Saves all weights and configurations"""
         print(f"\n{'=' * 60}")
         print("SAVING ALL MODEL WEIGHTS AND CONFIGURATIONS")
         print("=" * 60)
 
         os.makedirs(save_dir, exist_ok=True)
 
-        # Salvar pesos do gerador
+        # Save generator weights
         print("\n1. Saving generator weights...")
         generator_path = os.path.join(save_dir, 'generator.weights_w.h5')
         self.generator.save_weights(generator_path)
         print(f"   ✓ Generator weights saved to: {generator_path}")
 
-        # Salvar pesos do discriminador
+        # Save discriminator weights
         print("\n2. Saving discriminator weights...")
         discriminator_path = os.path.join(save_dir, 'discriminator.weights_w.h5')
         self.discriminator.save_weights(discriminator_path)
         print(f"   ✓ Discriminator weights saved to: {discriminator_path}")
 
-        # Salvar pesos completos
+        # Save complete weights
         print("\n3. Saving complete model weights...")
         complete_path = os.path.join(save_dir, 'stylegan2_complete.weights_w.h5')
         self.save_weights(complete_path)
         print(f"   ✓ Complete model weights saved to: {complete_path}")
 
-        # Salvar configuração detalhada
+        # Save detailed configuration
         print("\n4. Saving model configuration...")
         config = {
             'model_type': 'ImprovedStyleGAN2WithWSpace',
@@ -1249,12 +1391,12 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
             json.dump(config, f, indent=4, default=str)
         print(f"   ✓ Configuration saved to: {os.path.join(save_dir, 'model_config.json')}")
 
-        # Salvar dimensão W
+        # Save W dimension
         with open(os.path.join(save_dir, 'w_dim.txt'), 'w') as f:
             f.write(str(self.w_dim))
         print(f"   ✓ W dimension ({self.w_dim}) saved to: {os.path.join(save_dir, 'w_dim.txt')}")
 
-        # Salvar informações de assimilação
+        # Save assimilation information
         with open(os.path.join(save_dir, 'assimilation_info.txt'), 'w') as f:
             f.write("W-SPACE DATA ASSIMILATION INFORMATION\n")
             f.write("=" * 40 + "\n")
@@ -1279,7 +1421,7 @@ class ImprovedStyleGAN2WithWSpace(keras.Model):
 # ============================================
 
 class SampleSaverCallback(tf.keras.callbacks.Callback):
-    """Callback para salvar amostras e análise do espaço latente."""
+    """Callback to save samples and latent space analysis."""
 
     def __init__(self, generator, latent_dim, save_dir='training_outputs/samples',
                  latent_analysis_interval=50):
@@ -1328,7 +1470,7 @@ class SampleSaverCallback(tf.keras.callbacks.Callback):
 
 
 class EnhancedMetricCallback(tf.keras.callbacks.Callback):
-    """Callback aprimorado para calcular todas as métricas a cada 10 épocas."""
+    """Enhanced callback to compute all metrics every 10 epochs."""
 
     def __init__(self, generator, x_test, latent_dim, metric_interval=10,
                  log_file='training_metrics.txt', save_dir='training_outputs/metrics'):
@@ -1585,7 +1727,7 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
 
 
 class ImprovedStabilizationCallback(tf.keras.callbacks.Callback):
-    """Callback melhorado para estabilizar o treinamento."""
+    """Improved callback to stabilize training."""
 
     def __init__(self, threshold_ratio=0.8):
         super().__init__()
@@ -1644,7 +1786,7 @@ class ImprovedStabilizationCallback(tf.keras.callbacks.Callback):
 
 
 class AdaptiveLearningRateScheduler(tf.keras.callbacks.Callback):
-    """Learning rate scheduler adaptativo baseado em métricas."""
+    """Adaptive learning rate scheduler based on metrics."""
 
     def __init__(self, initial_lr_g=0.0001, initial_lr_d=0.0004):
         super().__init__()
@@ -1681,7 +1823,7 @@ class AdaptiveLearningRateScheduler(tf.keras.callbacks.Callback):
 
 
 class LivePlotCallback(keras.callbacks.Callback):
-    """Callback para visualização ao vivo do treinamento."""
+    """Callback for live visualization of training."""
 
     def __init__(self, model, data, num_images=10):
         super().__init__()
@@ -1728,7 +1870,7 @@ class LivePlotCallback(keras.callbacks.Callback):
 
 
 # ============================================
-# FUNÇÕES DE PLOTAGEM
+# PLOTTING FUNCTIONS
 # ============================================
 
 def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
@@ -2241,7 +2383,8 @@ def generate_final_report(all_metrics, execution_time, save_path='training_outpu
         f.write(f"W consistency weight: 0.05\n")
         f.write(f"Feature matching weight: 0.1\n")
         f.write(f"Generator Gaussian reg strength: 0.01\n")
-        f.write(f"Metric interval: {metric_interval}\n\n")
+        f.write(f"Metric interval: {metric_interval}\n")
+        f.write(f"FID/FRD sampling: 10 batches x 1000 samples (10000 total)\n\n")
 
         f.write("2. ARCHITECTURE IMPROVEMENTS\n")
         f.write("-" * 40 + "\n")
@@ -2513,6 +2656,7 @@ print(f"Gaussian reg strength: 0.01")
 print(f"Latent Gaussian weight: 0.1")
 print(f"W consistency weight: 0.05")
 print(f"Feature matching weight: 0.1")
+print(f"FID/FRD: 10 batches x 1000 samples (10000 total)")
 print("=" * 60)
 
 try:
@@ -2550,7 +2694,7 @@ try:
 
     print("\n✓ Training completed successfully!")
 
-    # Salvar pesos dos modelos
+    # Save model weights
     stylegan2.save_all_models_weights('training_outputs/final_models')
 
     print(f"\n{'=' * 60}")
@@ -2558,7 +2702,7 @@ try:
     print("=" * 60)
 
     print("Generating final samples...")
-    size = min(5000, len(x_test))
+    size = min(10000, len(x_test))
     noise = np.random.normal(0, 1, (size, latent_dim))
     fake_data = generator.predict(noise, verbose=0, batch_size=32)
     real_data = x_test[:size]
@@ -2581,7 +2725,7 @@ try:
         save_dir='training_outputs/latent_analysis'
     )
 
-    # Consolidar métricas
+    # Consolidate metrics
     final_metrics = {
         'traditional': final_traditional_metrics,
         'static': final_static_metrics,
@@ -2600,7 +2744,7 @@ try:
 
     print("\nGenerating final visualizations...")
 
-    # Amostras finais
+    # Final samples
     noise = np.random.normal(0, 1, (6, latent_dim))
     final_samples = generator.predict(noise, verbose=0)
 
@@ -2650,11 +2794,11 @@ try:
     print(f"W dimension ({w_dim}) has been saved for data assimilation")
     print(f"Final report saved to: training_outputs/FINAL_REPORT.txt")
     print(f"Final model weights saved in: training_outputs/final_models/")
-    print(f"  - generator.weights_z.h5")
-    print(f"  - discriminator.weights_z.h5")
-    print(f"  - stylegan2_complete.weights_z.h5")
+    print(f"  - generator.weights_w.h5")
+    print(f"  - discriminator.weights_w.h5")
+    print(f"  - stylegan2_complete.weights_w.h5")
     print(f"  - w_dim.txt")
-    print(f"  - assimiration_info.txt")
+    print(f"  - assimilation_info.txt")
     print("=" * 60)
 
     print("\nFINAL METRICS SUMMARY:")
