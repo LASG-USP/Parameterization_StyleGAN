@@ -1,5 +1,7 @@
 # Parameterization method of reservoir properties for ensemble-based data assimilation using intermediate latent space of StyleGAN 
 
+Arxiv: https://arxiv.org/abs/2609.39626
+
 This research is the improvement the generation of image facies with geologic realism in the same time with better data assimilation, trough the StyleGAN model using intermediate latent space (w-space). To demonstrate the effectiveness of this method, we compared our approach with data assimilation using the conventional latent z-space, as well as against state-of-the art models in these problems, such as Latent Diffusion models (Federico and Durlofsky, 2025) and VAE-GAN (Sampaio et al., 2026). The results demonstrated that all three models are highly efficient, with the StyleGAN2 model standing out for generating samples with geological realism and achieving excellent data matching in the cases studied.
 
 Parameterization_StyleGAN is a python3 project providing tools for the parameterization of reservoir properties for data assimilation using ESMDA.
@@ -98,8 +100,6 @@ To verify the quality and geological realism of the generated samples: variogram
 Federico, G.; Durlofsky, L. J. Latent diffusion models for parameterization of facies-based geomodels and their use in data assimilation, Computers & Geosciences, Volume 194, 2025, 105755, ISSN 0098-3004, https://doi.org/10.1016/j.cageo.2024.105755.
 
 Sampaio, M. A.; Ranazzi, P. H.; Blunt, M. J.; Enhancing the parameterization of reservoir properties for data assimilation using deep VAE-GAN, Computers & Geosciences, Volume 214, 2026, 106196, ISSN 0098-3004, https://doi.org/10.1016/j.cageo.2026.106196.
-
-
 
 The SG package implements three deep learning models (VAE-GAN, LDM and StyleGAN2) for parameterization and data assimilation that were
 investigated and discussed in:
