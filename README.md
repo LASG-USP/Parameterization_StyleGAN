@@ -7,7 +7,7 @@ This research is the improvement the generation of image facies with geologic re
 Parameterization_StyleGAN is a python3 project providing tools for the parameterization of reservoir properties for data assimilation using ESMDA.
 
 
-Version 1.0 - September 2026
+Version 2.0 - November 2026
 
 Main results:
 
