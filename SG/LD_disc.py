@@ -1,77 +1,47 @@
+# ============================================================================
+# 1. IMPORTS & CONFIGURATION
+# ============================================================================
+
 import os
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
+import gc
+import time
+import pickle
+import warnings
+import glob
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
+import psutil
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
-import matplotlib.pyplot as plt
+from tensorflow.keras import layers, backend as K
 from tensorflow.keras.layers import LeakyReLU, BatchNormalization
 from tensorflow.keras.models import load_model
+from tensorflow.keras.callbacks import Callback
 from keras import Model
 from keras.applications.inception_v3 import InceptionV3
-from scipy.stats import gaussian_kde
+
+from scipy.stats import gaussian_kde, entropy
 from scipy.spatial.distance import pdist, squareform
 from scipy.linalg import sqrtm
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS
-import time
-import seaborn as sns
-import pandas as pd
-import pickle
-import gc
-import psutil
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
-from scipy.stats import entropy
 from sklearn.metrics import pairwise_kernels
 from sklearn.impute import SimpleImputer
-import warnings
-import glob
-from datetime import datetime
-import gc
-from tensorflow.keras import backend as K
-from tensorflow.keras.callbacks import Callback
-from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
-import psutil
+
 from metrics import *
 
-class ClearMemoryCallback(Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        gc.collect()
-        K.clear_session()
 
-warnings.filterwarnings('ignore')
-
-tf.keras.backend.clear_session()
-gc.collect()
-
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"Available GPUs: {len(gpus)}")
-    except RuntimeError as e:
-        print(e)
-
-# Global matplotlib configuration
-plt.rcParams.update({
-    'font.size': 20,
-    'axes.titlesize': 24,
-    'axes.labelsize': 22,
-    'xtick.labelsize': 18,
-    'ytick.labelsize': 18,
-    'legend.fontsize': 18,
-    'figure.titlesize': 26,
-    'figure.dpi': 100,
-    'savefig.dpi': 300,
-    'font.family': 'sans-serif',
-})
-
-# Configuration
+# ----------------------------------------------------------------------------
+# Global configuration
+# ----------------------------------------------------------------------------
 zdim = 512
 epochs = 150
 batch_size = 32
@@ -115,7 +85,44 @@ HIGH_RES_CONFIG = {
     'save_formats': ['png', 'svg']
 }
 
-# Data loading and preprocessing
+# ----------------------------------------------------------------------------
+# Environment setup
+# ----------------------------------------------------------------------------
+warnings.filterwarnings('ignore')
+
+tf.keras.backend.clear_session()
+gc.collect()
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"Available GPUs: {len(gpus)}")
+    except RuntimeError as e:
+        print(e)
+
+# Global matplotlib configuration
+plt.rcParams.update({
+    'font.size': 20,
+    'axes.titlesize': 24,
+    'axes.labelsize': 22,
+    'xtick.labelsize': 18,
+    'ytick.labelsize': 18,
+    'legend.fontsize': 18,
+    'figure.titlesize': 26,
+    'figure.dpi': 100,
+    'savefig.dpi': 300,
+    'font.family': 'sans-serif',
+})
+
+os.makedirs('training_outputs', exist_ok=True)
+
+
+# ============================================================================
+# 2. DATA LOADING & PREPROCESSING
+# ============================================================================
+
 X_train = np.load('datasets/Three_facies_2d.npy').astype('float32')
 
 if X_train.max() > 1.0:
@@ -144,248 +151,13 @@ print(f"FID epsilon: {FID_EPS}")
 print(f"{'=' * 60}\n")
 
 
-class MemoryOptimizer:
-    @staticmethod
-    def memory_usage():
-        process = psutil.Process()
-        return process.memory_info().rss / 1024 ** 2
+# ============================================================================
+# 3. MODEL ARCHITECTURE
+# ============================================================================
 
-    @staticmethod
-    def clear_memory():
-        tf.keras.backend.clear_session()
-        gc.collect()
-
-    @staticmethod
-    def check_memory(threshold_mb=8000):
-        current_memory = MemoryOptimizer.memory_usage()
-        if current_memory > threshold_mb:
-            MemoryOptimizer.clear_memory()
-            print(f"Memory cleared. Current usage: {current_memory:.2f} MB")
-            return True
-        return False
-
-
-class StaticMetrics:
-    @staticmethod
-    def variogram_2d_optimized(data, lag_distances=None, max_lag=None):
-        if len(data.shape) == 4:
-            data = data[..., 0]
-        n_samples, height, width = data.shape[:3]
-        if lag_distances is None:
-            if max_lag is None:
-                max_lag = min(height, width) // 2
-            lag_distances = np.arange(1, max_lag + 1)
-        variogram = np.zeros(len(lag_distances))
-        counts = np.zeros(len(lag_distances))
-        for k, lag in enumerate(lag_distances):
-            if lag < width:
-                diff_h = data[:, :, :-lag] - data[:, :, lag:]
-                variogram[k] += np.sum(diff_h ** 2) * n_samples
-                counts[k] += diff_h.size
-            if lag < height:
-                diff_v = data[:, :-lag, :] - data[:, lag:, :]
-                variogram[k] += np.sum(diff_v ** 2) * n_samples
-                counts[k] += diff_v.size
-        variogram = variogram / (2 * counts + 1e-10)
-        return lag_distances, variogram
-
-    @staticmethod
-    def connectivity_function(data, threshold, lag_distances=None):
-        if len(data.shape) == 4:
-            data = data[..., 0]
-        n_samples, height, width = data.shape[:3]
-        binary_data = (data > threshold).astype(np.float32)
-        if lag_distances is None:
-            max_lag = min(height, width) // 2
-            lag_distances = np.arange(1, max_lag + 1)
-        connectivity = np.zeros(len(lag_distances), dtype=np.float64)
-        for k, lag in enumerate(lag_distances):
-            conn = 0.0
-            total = 0.0
-            if lag < width:
-                a = binary_data[:, :, :-lag]
-                b = binary_data[:, :, lag:]
-                conn += np.sum(a * b)
-                total += a.size
-            if lag < height:
-                a = binary_data[:, :-lag, :]
-                b = binary_data[:, lag:, :]
-                conn += np.sum(a * b)
-                total += a.size
-            if total > 0:
-                connectivity[k] = conn / total
-        return lag_distances, connectivity
-
-    @staticmethod
-    def calculate_pca_features(data, n_components=50):
-        n_samples, height, width, channels = data.shape
-        data_flat = data.reshape(n_samples, -1)
-        pca = PCA(n_components=min(n_components, min(data_flat.shape)))
-        pca_features = pca.fit_transform(data_flat)
-        return pca_features, pca.explained_variance_ratio_
-
-    @staticmethod
-    def calculate_mds_features(data, n_components=2, subsample=1000):
-        if len(data) > subsample:
-            idx = np.random.choice(len(data), subsample, replace=False)
-            data_subsample = data[idx]
-        else:
-            data_subsample = data
-        n_samples = len(data_subsample)
-        data_flat = data_subsample.reshape(n_samples, -1)
-        pca = PCA(n_components=min(50, data_flat.shape[1]))
-        data_pca = pca.fit_transform(data_flat)
-        mds = MDS(n_components=min(n_components, data_pca.shape[1]),
-                  random_state=42, n_jobs=-1)
-        mds_features = mds.fit_transform(data_pca)
-        return mds_features
-
-
-def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
-    if formats is None:
-        formats = HIGH_RES_CONFIG['save_formats']
-    saved_files = []
-    for fmt in formats:
-        filename = f"{base_filename}.{fmt}"
-        if fmt == 'png':
-            fig.savefig(filename, dpi=dpi, bbox_inches='tight',
-                        facecolor='white', edgecolor='none')
-        elif fmt == 'svg':
-            fig.savefig(filename, format='svg', bbox_inches='tight',
-                        facecolor='white', edgecolor='none')
-        else:
-            continue
-        saved_files.append(filename)
-        print(f"  Saved: {filename}")
-    return saved_files
-
-
-def get_feature_extractors():
-    iv3 = InceptionV3(include_top=False, pooling='avg', input_shape=(75, 75, 3))
-    f_extraction_iv3 = Model(inputs=iv3.input, outputs=iv3.layers[-1].output)
-    RC_full = load_model('Reservoir_classifier.h5')
-    f_extraction_rc = Model(inputs=RC_full.input,
-                            outputs=layers.GlobalAveragePooling2D()(RC_full.layers[-5].output))
-    return f_extraction_iv3, f_extraction_rc
-
-
-f_extraction_iv3, f_extraction_rc = get_feature_extractors()
-
-print(f"\n[EXTRACTOR INFO]")
-print(f"  InceptionV3 input_shape : {f_extraction_iv3.input_shape}")
-print(f"  ReservoirClassifier input_shape: {f_extraction_rc.input_shape}")
-print("")
-
-
-def frechet_distance_stable(act_real, act_gen, eps=FID_EPS):
-    mu_r = np.mean(act_real, axis=0)
-    mu_g = np.mean(act_gen, axis=0)
-    sigma_r = np.cov(act_real, rowvar=False)
-    sigma_g = np.cov(act_gen, rowvar=False)
-    sigma_r = np.atleast_2d(sigma_r)
-    sigma_g = np.atleast_2d(sigma_g)
-    sigma_r = sigma_r + np.eye(sigma_r.shape[0]) * eps
-    sigma_g = sigma_g + np.eye(sigma_g.shape[0]) * eps
-    diff = mu_r - mu_g
-    mean_diff = float(np.dot(diff, diff))
-    covmean = sqrtm(sigma_r @ sigma_g)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    trace_term = float(np.trace(sigma_r + sigma_g - 2.0 * covmean))
-    fid = mean_diff + trace_term
-    if not np.isfinite(fid):
-        return 1e12
-    return max(fid, 0.0)
-
-
-def frechet_distance_batched(real_features, fake_features,
-                              n_batches=10, batch_size=1000, eps=FID_EPS):
-    """
-    Computes the Frechet Distance using batched computation over 10 batches of 1000 samples.
-    Accumulates the statistics (mean and covariance) incrementally between batches,
-    without keeping all features at once to compute the statistics.
-    """
-    real_features = np.asarray(real_features, dtype=np.float64)
-    fake_features = np.asarray(fake_features, dtype=np.float64)
-
-    real_features = np.nan_to_num(real_features, nan=0.0, posinf=0.0, neginf=0.0)
-    fake_features = np.nan_to_num(fake_features, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Accumulate statistics for the real features
-    real_sum = np.zeros(real_features.shape[1], dtype=np.float64)
-    real_sum_sq = np.zeros((real_features.shape[1], real_features.shape[1]), dtype=np.float64)
-    real_count = 0
-
-    for i in range(n_batches):
-        start = i * batch_size
-        end = start + batch_size
-        batch = real_features[start:end]
-        if batch.shape[0] == 0:
-            continue
-        real_sum += batch.sum(axis=0)
-        real_sum_sq += batch.T @ batch
-        real_count += batch.shape[0]
-
-    mu_r = real_sum / real_count
-    sigma_r = (real_sum_sq / real_count) - np.outer(mu_r, mu_r)
-
-    # Accumulate statistics for the generated features
-    fake_sum = np.zeros(fake_features.shape[1], dtype=np.float64)
-    fake_sum_sq = np.zeros((fake_features.shape[1], fake_features.shape[1]), dtype=np.float64)
-    fake_count = 0
-
-    for i in range(n_batches):
-        start = i * batch_size
-        end = start + batch_size
-        batch = fake_features[start:end]
-        if batch.shape[0] == 0:
-            continue
-        fake_sum += batch.sum(axis=0)
-        fake_sum_sq += batch.T @ batch
-        fake_count += batch.shape[0]
-
-    mu_g = fake_sum / fake_count
-    sigma_g = (fake_sum_sq / fake_count) - np.outer(mu_g, mu_g)
-
-    sigma_r = np.atleast_2d(sigma_r)
-    sigma_g = np.atleast_2d(sigma_g)
-    sigma_r = sigma_r + np.eye(sigma_r.shape[0]) * eps
-    sigma_g = sigma_g + np.eye(sigma_g.shape[0]) * eps
-
-    diff = mu_r - mu_g
-    mean_diff = float(np.dot(diff, diff))
-    covmean = sqrtm(sigma_r @ sigma_g)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    trace_term = float(np.trace(sigma_r + sigma_g - 2.0 * covmean))
-    fid = mean_diff + trace_term
-    if not np.isfinite(fid):
-        return 1e12
-    return max(fid, 0.0)
-
-
-def kernel_distance_stable(act_real, act_gen, num_blocks=50, max_block_size=500):
-    n = min(len(act_real), len(act_gen), max_block_size)
-    x = act_real[:n]
-    y = act_gen[:n]
-    d = x.shape[1]
-    k = 3
-    coef = 1.0 / d
-
-    def poly_kernel(a, b):
-        return (a @ b.T / d + coef) ** k
-
-    k_xx = poly_kernel(x, x).mean()
-    k_yy = poly_kernel(y, y).mean()
-    k_xy = poly_kernel(x, y).mean()
-    mmd2 = k_xx + k_yy - 2 * k_xy
-    return max(float(mmd2), 0.0)
-
-
-# ==============================================
-# MODELS: ENCODER / SOFTMAX DECODER / CONTINUOUS DECODER / UNET
-# ==============================================
-
+# ----------------------------------------------------------------------------
+# 3.1 VAE Encoder
+# ----------------------------------------------------------------------------
 def build_vae_encoder(input_shape, latent_dim):
     inputs = keras.Input(shape=input_shape, dtype=tf.float32)
     x = layers.Conv2D(32, 3, strides=2, padding="same", dtype=tf.float32)(inputs)
@@ -413,6 +185,9 @@ def build_vae_encoder(input_shape, latent_dim):
 encoder = build_vae_encoder((ni, nj, nz), latent_dim)
 
 
+# ----------------------------------------------------------------------------
+# 3.2 Softmax Decoder (used in training)
+# ----------------------------------------------------------------------------
 def build_decoder_softmax(latent_dim, num_classes):
     latent_inputs = keras.Input(shape=(latent_dim,), dtype=tf.float32)
     x = layers.Dense(6 * 6 * 256, dtype=tf.float32)(latent_inputs)
@@ -436,6 +211,9 @@ def build_decoder_softmax(latent_dim, num_classes):
 decoder_softmax = build_decoder_softmax(latent_dim, num_classes)
 
 
+# ----------------------------------------------------------------------------
+# 3.3 Continuous Decoder (derived from softmax, for assimilation)
+# ----------------------------------------------------------------------------
 def build_decoder_continuous(latent_dim, activation='linear'):
     """
     Continuous decoder (1 channel) to serve as an observation operator
@@ -465,6 +243,9 @@ def build_decoder_continuous(latent_dim, activation='linear'):
 decoder_continuous = build_decoder_continuous(latent_dim, activation='linear')
 
 
+# ----------------------------------------------------------------------------
+# 3.4 1D UNet Denoiser
+# ----------------------------------------------------------------------------
 def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
     assert latent_dim % 8 == 0, \
         f"latent_dim must be divisible by 8 for 3 pooling levels (got {latent_dim})"
@@ -545,6 +326,9 @@ def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
 unet = build_unet_model(latent_dim, time_emb_dim=256, base_filters=64)
 
 
+# ----------------------------------------------------------------------------
+# 3.5 Diffusion Model (composite)
+# ----------------------------------------------------------------------------
 class DiffusionModel(keras.Model):
     """Latent Diffusion (VAE encoder + 1D UNet denoiser + softmax decoder).
     The continuous decoder is NOT part of training — it is derived afterwards.
@@ -754,71 +538,262 @@ _ = diffusion_model(dummy_input)
 diffusion_model.compile()
 
 
-# ==============================================
-# SOFTMAX → CONTINUOUS TRANSFER (after training)
-# ==============================================
+# ============================================================================
+# 4. METRICS & UTILITIES
+# ============================================================================
 
-def transfer_softmax_to_continuous(decoder_softmax, decoder_continuous,
-                                     class_values=(-1.0, 0.0, 1.0)):
+# ----------------------------------------------------------------------------
+# 4.1 Memory optimizer
+# ----------------------------------------------------------------------------
+class MemoryOptimizer:
+    @staticmethod
+    def memory_usage():
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 ** 2
+
+    @staticmethod
+    def clear_memory():
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+    @staticmethod
+    def check_memory(threshold_mb=8000):
+        current_memory = MemoryOptimizer.memory_usage()
+        if current_memory > threshold_mb:
+            MemoryOptimizer.clear_memory()
+            print(f"Memory cleared. Current usage: {current_memory:.2f} MB")
+            return True
+        return False
+
+
+# ----------------------------------------------------------------------------
+# 4.2 Static geostatistical metrics
+# ----------------------------------------------------------------------------
+class StaticMetrics:
+    @staticmethod
+    def variogram_2d_optimized(data, lag_distances=None, max_lag=None):
+        if len(data.shape) == 4:
+            data = data[..., 0]
+        n_samples, height, width = data.shape[:3]
+        if lag_distances is None:
+            if max_lag is None:
+                max_lag = min(height, width) // 2
+            lag_distances = np.arange(1, max_lag + 1)
+        variogram = np.zeros(len(lag_distances))
+        counts = np.zeros(len(lag_distances))
+        for k, lag in enumerate(lag_distances):
+            if lag < width:
+                diff_h = data[:, :, :-lag] - data[:, :, lag:]
+                variogram[k] += np.sum(diff_h ** 2) * n_samples
+                counts[k] += diff_h.size
+            if lag < height:
+                diff_v = data[:, :-lag, :] - data[:, lag:, :]
+                variogram[k] += np.sum(diff_v ** 2) * n_samples
+                counts[k] += diff_v.size
+        variogram = variogram / (2 * counts + 1e-10)
+        return lag_distances, variogram
+
+    @staticmethod
+    def connectivity_function(data, threshold, lag_distances=None):
+        if len(data.shape) == 4:
+            data = data[..., 0]
+        n_samples, height, width = data.shape[:3]
+        binary_data = (data > threshold).astype(np.float32)
+        if lag_distances is None:
+            max_lag = min(height, width) // 2
+            lag_distances = np.arange(1, max_lag + 1)
+        connectivity = np.zeros(len(lag_distances), dtype=np.float64)
+        for k, lag in enumerate(lag_distances):
+            conn = 0.0
+            total = 0.0
+            if lag < width:
+                a = binary_data[:, :, :-lag]
+                b = binary_data[:, :, lag:]
+                conn += np.sum(a * b)
+                total += a.size
+            if lag < height:
+                a = binary_data[:, :-lag, :]
+                b = binary_data[:, lag:, :]
+                conn += np.sum(a * b)
+                total += a.size
+            if total > 0:
+                connectivity[k] = conn / total
+        return lag_distances, connectivity
+
+    @staticmethod
+    def calculate_pca_features(data, n_components=50):
+        n_samples, height, width, channels = data.shape
+        data_flat = data.reshape(n_samples, -1)
+        pca = PCA(n_components=min(n_components, min(data_flat.shape)))
+        pca_features = pca.fit_transform(data_flat)
+        return pca_features, pca.explained_variance_ratio_
+
+    @staticmethod
+    def calculate_mds_features(data, n_components=2, subsample=1000):
+        if len(data) > subsample:
+            idx = np.random.choice(len(data), subsample, replace=False)
+            data_subsample = data[idx]
+        else:
+            data_subsample = data
+        n_samples = len(data_subsample)
+        data_flat = data_subsample.reshape(n_samples, -1)
+        pca = PCA(n_components=min(50, data_flat.shape[1]))
+        data_pca = pca.fit_transform(data_flat)
+        mds = MDS(n_components=min(n_components, data_pca.shape[1]),
+                  random_state=42, n_jobs=-1)
+        mds_features = mds.fit_transform(data_pca)
+        return mds_features
+
+
+# ----------------------------------------------------------------------------
+# 4.3 Feature extractors
+# ----------------------------------------------------------------------------
+def get_feature_extractors():
+    iv3 = InceptionV3(include_top=False, pooling='avg', input_shape=(75, 75, 3))
+    f_extraction_iv3 = Model(inputs=iv3.input, outputs=iv3.layers[-1].output)
+    RC_full = load_model('Reservoir_classifier.h5')
+    f_extraction_rc = Model(inputs=RC_full.input,
+                            outputs=layers.GlobalAveragePooling2D()(RC_full.layers[-5].output))
+    return f_extraction_iv3, f_extraction_rc
+
+
+f_extraction_iv3, f_extraction_rc = get_feature_extractors()
+
+print(f"\n[EXTRACTOR INFO]")
+print(f"  InceptionV3 input_shape : {f_extraction_iv3.input_shape}")
+print(f"  ReservoirClassifier input_shape: {f_extraction_rc.input_shape}")
+print("")
+
+
+# ----------------------------------------------------------------------------
+# 4.4 Frechet Distance utilities
+# ----------------------------------------------------------------------------
+def frechet_distance_stable(act_real, act_gen, eps=FID_EPS):
+    mu_r = np.mean(act_real, axis=0)
+    mu_g = np.mean(act_gen, axis=0)
+    sigma_r = np.cov(act_real, rowvar=False)
+    sigma_g = np.cov(act_gen, rowvar=False)
+    sigma_r = np.atleast_2d(sigma_r)
+    sigma_g = np.atleast_2d(sigma_g)
+    sigma_r = sigma_r + np.eye(sigma_r.shape[0]) * eps
+    sigma_g = sigma_g + np.eye(sigma_g.shape[0]) * eps
+    diff = mu_r - mu_g
+    mean_diff = float(np.dot(diff, diff))
+    covmean = sqrtm(sigma_r @ sigma_g)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    trace_term = float(np.trace(sigma_r + sigma_g - 2.0 * covmean))
+    fid = mean_diff + trace_term
+    if not np.isfinite(fid):
+        return 1e12
+    return max(fid, 0.0)
+
+
+def frechet_distance_batched(real_features, fake_features,
+                              n_batches=10, batch_size=1000, eps=FID_EPS):
     """
-    Copies the weights from the softmax decoder to the continuous decoder.
+    Computes the Frechet Distance using batched computation over 10 batches of 1000 samples.
+    Accumulates the statistics (mean and covariance) incrementally between batches,
+    without keeping all features at once to compute the statistics.
     """
-    w_sm = decoder_softmax.get_weights()
-    w_ct = decoder_continuous.get_weights()
+    real_features = np.asarray(real_features, dtype=np.float64)
+    fake_features = np.asarray(fake_features, dtype=np.float64)
 
-    assert len(w_sm) == len(w_ct), (
-        f"Weight count mismatch: softmax has {len(w_sm)}, "
-        f"continuous has {len(w_ct)}. Check that the architectures "
-        f"match up to the last layer."
-    )
+    real_features = np.nan_to_num(real_features, nan=0.0, posinf=0.0, neginf=0.0)
+    fake_features = np.nan_to_num(fake_features, nan=0.0, posinf=0.0, neginf=0.0)
 
-    n_shared = len(w_ct) - 2
-    for i in range(n_shared):
-        w_ct[i] = w_sm[i].copy()
+    # Accumulate statistics for the real features
+    real_sum = np.zeros(real_features.shape[1], dtype=np.float64)
+    real_sum_sq = np.zeros((real_features.shape[1], real_features.shape[1]), dtype=np.float64)
+    real_count = 0
 
-    class_values = np.array(class_values, dtype=np.float32)
-    w_ct[-2] = np.tensordot(
-        w_sm[-2], class_values, axes=([-1], [0])
-    )[..., np.newaxis].astype(np.float32)
-    w_ct[-1] = np.array([np.dot(w_sm[-1], class_values)], dtype=np.float32)
+    for i in range(n_batches):
+        start = i * batch_size
+        end = start + batch_size
+        batch = real_features[start:end]
+        if batch.shape[0] == 0:
+            continue
+        real_sum += batch.sum(axis=0)
+        real_sum_sq += batch.T @ batch
+        real_count += batch.shape[0]
 
-    decoder_continuous.set_weights(w_ct)
-    return decoder_continuous
+    mu_r = real_sum / real_count
+    sigma_r = (real_sum_sq / real_count) - np.outer(mu_r, mu_r)
+
+    # Accumulate statistics for the generated features
+    fake_sum = np.zeros(fake_features.shape[1], dtype=np.float64)
+    fake_sum_sq = np.zeros((fake_features.shape[1], fake_features.shape[1]), dtype=np.float64)
+    fake_count = 0
+
+    for i in range(n_batches):
+        start = i * batch_size
+        end = start + batch_size
+        batch = fake_features[start:end]
+        if batch.shape[0] == 0:
+            continue
+        fake_sum += batch.sum(axis=0)
+        fake_sum_sq += batch.T @ batch
+        fake_count += batch.shape[0]
+
+    mu_g = fake_sum / fake_count
+    sigma_g = (fake_sum_sq / fake_count) - np.outer(mu_g, mu_g)
+
+    sigma_r = np.atleast_2d(sigma_r)
+    sigma_g = np.atleast_2d(sigma_g)
+    sigma_r = sigma_r + np.eye(sigma_r.shape[0]) * eps
+    sigma_g = sigma_g + np.eye(sigma_g.shape[0]) * eps
+
+    diff = mu_r - mu_g
+    mean_diff = float(np.dot(diff, diff))
+    covmean = sqrtm(sigma_r @ sigma_g)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    trace_term = float(np.trace(sigma_r + sigma_g - 2.0 * covmean))
+    fid = mean_diff + trace_term
+    if not np.isfinite(fid):
+        return 1e12
+    return max(fid, 0.0)
 
 
-def sanity_check_decoders(encoder, decoder_softmax, decoder_continuous,
-                          x_test, n=20):
-    """
-    Confirms that the weight transfer preserved the information.
-    """
-    idx = np.random.choice(len(x_test), size=min(n, len(x_test)), replace=False)
-    x_batch = x_test[idx]
+def kernel_distance_stable(act_real, act_gen, num_blocks=50, max_block_size=500):
+    n = min(len(act_real), len(act_gen), max_block_size)
+    x = act_real[:n]
+    y = act_gen[:n]
+    d = x.shape[1]
+    k = 3
+    coef = 1.0 / d
 
-    z_mean, _ = encoder.predict(x_batch, verbose=0)
-    y_sm = decoder_softmax.predict(z_mean, verbose=0)
-    y_ct = decoder_continuous.predict(z_mean, verbose=0)
+    def poly_kernel(a, b):
+        return (a @ b.T / d + coef) ** k
 
-    cls_sm = np.argmax(y_sm, axis=-1) - 1
-    cls_ct = np.round(y_ct[..., 0]).clip(-1, 1).astype(int)
-    agreement = float(np.mean(cls_sm == cls_ct))
-
-    print("\n" + "=" * 60)
-    print("SANITY CHECK: SOFTMAX DECODER vs CONTINUOUS DECODER")
-    print("=" * 60)
-    print(f"  y_softmax.shape      : {y_sm.shape}")
-    print(f"  y_continuous.shape   : {y_ct.shape}")
-    print(f"  y_softmax range      : [{y_sm.min():.3f}, {y_sm.max():.3f}]")
-    print(f"  y_continuous range   : [{y_ct.min():.3f}, {y_ct.max():.3f}]")
-    print(f"  Agreement cls_sm == cls_ct: {agreement:.4f}")
-    print(f"  (expected > 0.9 if the transfer preserved the information)")
-    print("=" * 60 + "\n")
-
-    return agreement
+    k_xx = poly_kernel(x, x).mean()
+    k_yy = poly_kernel(y, y).mean()
+    k_xy = poly_kernel(x, y).mean()
+    mmd2 = k_xx + k_yy - 2 * k_xy
+    return max(float(mmd2), 0.0)
 
 
-# ==============================================
-# PLOTTING FUNCTIONS
-# ==============================================
+# ----------------------------------------------------------------------------
+# 4.5 Plotting utilities
+# ----------------------------------------------------------------------------
+def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
+    if formats is None:
+        formats = HIGH_RES_CONFIG['save_formats']
+    saved_files = []
+    for fmt in formats:
+        filename = f"{base_filename}.{fmt}"
+        if fmt == 'png':
+            fig.savefig(filename, dpi=dpi, bbox_inches='tight',
+                        facecolor='white', edgecolor='none')
+        elif fmt == 'svg':
+            fig.savefig(filename, format='svg', bbox_inches='tight',
+                        facecolor='white', edgecolor='none')
+        else:
+            continue
+        saved_files.append(filename)
+        print(f"  Saved: {filename}")
+    return saved_files
+
 
 def plot_histograms_and_densities(original, reconstructed, latent, epoch=None, save_interval=10):
     figsize = (24 * HIGH_RES_CONFIG['figsize_multiplier'],
@@ -929,9 +904,394 @@ def analyze_latent_space(encoder, data, num_samples=1000):
     return z_mean.flatten()
 
 
-# ==============================================
-# CALLBACKS
-# ==============================================
+# ----------------------------------------------------------------------------
+# 4.6 Decoder transfer utilities
+# ----------------------------------------------------------------------------
+def transfer_softmax_to_continuous(decoder_softmax, decoder_continuous,
+                                     class_values=(-1.0, 0.0, 1.0)):
+    """
+    Copies the weights from the softmax decoder to the continuous decoder.
+    """
+    w_sm = decoder_softmax.get_weights()
+    w_ct = decoder_continuous.get_weights()
+
+    assert len(w_sm) == len(w_ct), (
+        f"Weight count mismatch: softmax has {len(w_sm)}, "
+        f"continuous has {len(w_ct)}. Check that the architectures "
+        f"match up to the last layer."
+    )
+
+    n_shared = len(w_ct) - 2
+    for i in range(n_shared):
+        w_ct[i] = w_sm[i].copy()
+
+    class_values = np.array(class_values, dtype=np.float32)
+    w_ct[-2] = np.tensordot(
+        w_sm[-2], class_values, axes=([-1], [0])
+    )[..., np.newaxis].astype(np.float32)
+    w_ct[-1] = np.array([np.dot(w_sm[-1], class_values)], dtype=np.float32)
+
+    decoder_continuous.set_weights(w_ct)
+    return decoder_continuous
+
+
+def sanity_check_decoders(encoder, decoder_softmax, decoder_continuous,
+                          x_test, n=20):
+    """
+    Confirms that the weight transfer preserved the information.
+    """
+    idx = np.random.choice(len(x_test), size=min(n, len(x_test)), replace=False)
+    x_batch = x_test[idx]
+
+    z_mean, _ = encoder.predict(x_batch, verbose=0)
+    y_sm = decoder_softmax.predict(z_mean, verbose=0)
+    y_ct = decoder_continuous.predict(z_mean, verbose=0)
+
+    cls_sm = np.argmax(y_sm, axis=-1) - 1
+    cls_ct = np.round(y_ct[..., 0]).clip(-1, 1).astype(int)
+    agreement = float(np.mean(cls_sm == cls_ct))
+
+    print("\n" + "=" * 60)
+    print("SANITY CHECK: SOFTMAX DECODER vs CONTINUOUS DECODER")
+    print("=" * 60)
+    print(f"  y_softmax.shape      : {y_sm.shape}")
+    print(f"  y_continuous.shape   : {y_ct.shape}")
+    print(f"  y_softmax range      : [{y_sm.min():.3f}, {y_sm.max():.3f}]")
+    print(f"  y_continuous range   : [{y_ct.min():.3f}, {y_ct.max():.3f}]")
+    print(f"  Agreement cls_sm == cls_ct: {agreement:.4f}")
+    print(f"  (expected > 0.9 if the transfer preserved the information)")
+    print("=" * 60 + "\n")
+
+    return agreement
+
+
+# ----------------------------------------------------------------------------
+# 4.7 Final report generator
+# ----------------------------------------------------------------------------
+def generate_final_report(filepath, params, execution_time, loss_history, metrics_history,
+                          static_metrics_results, adaptive_kl_history=None,
+                          decoder_transfer_agreement=None):
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("               FINAL LATENT DIFFUSION TRAINING REPORT\n")
+        f.write("=" * 80 + "\n\n")
+
+        f.write(f"Date/Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("TRAINING PARAMETERS\n")
+        f.write("-" * 80 + "\n")
+        for key, value in params.items():
+            f.write(f"  {key:<35}: {value}\n")
+        f.write("\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("EXECUTION TIME\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"  Total Time (seconds) : {execution_time:.2f}s\n")
+        f.write(f"  Total Time (minutes) : {execution_time / 60:.2f}min\n")
+        f.write(f"  Total Time (hours)   : {execution_time / 3600:.2f}h\n\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("TRAINING METRICS (FINAL VALUES)\n")
+        f.write("-" * 80 + "\n")
+
+        if loss_history.total_losses:
+            last_epoch = len(loss_history.total_losses)
+            f.write(f"  Total epochs trained: {last_epoch}\n\n")
+            f.write("  Training Losses (last epoch):\n")
+            f.write(f"    Total Loss       : {loss_history.total_losses[-1]:.6f}\n")
+            f.write(f"    Diffusion Loss   : {loss_history.diffusion_losses[-1]:.6f}\n")
+            f.write(f"    Reconstruction   : {loss_history.recon_losses[-1]:.6f}\n")
+            f.write(f"    KL Loss          : {loss_history.kl_losses[-1]:.6f}\n\n")
+
+            f.write("  Validation Losses (last epoch):\n")
+            f.write(f"    Total Loss       : {loss_history.val_total_losses[-1]:.6f}\n")
+            f.write(f"    Diffusion Loss   : {loss_history.val_diffusion_losses[-1]:.6f}\n")
+            f.write(f"    Reconstruction   : {loss_history.val_recon_losses[-1]:.6f}\n")
+            f.write(f"    KL Loss          : {loss_history.val_kl_losses[-1]:.6f}\n\n")
+
+            f.write("  Best values during training:\n")
+            f.write(
+                f"    Lowest Total Loss (train)      : {min(loss_history.total_losses):.6f} (epoch {np.argmin(loss_history.total_losses) + 1})\n")
+            f.write(
+                f"    Lowest Total Loss (val)        : {min(loss_history.val_total_losses):.6f} (epoch {np.argmin(loss_history.val_total_losses) + 1})\n")
+            f.write(
+                f"    Lowest Diffusion Loss (train)  : {min(loss_history.diffusion_losses):.6f} (epoch {np.argmin(loss_history.diffusion_losses) + 1})\n")
+            f.write(
+                f"    Lowest Recon Loss (train)      : {min(loss_history.recon_losses):.6f} (epoch {np.argmin(loss_history.recon_losses) + 1})\n")
+            f.write(
+                f"    Lowest KL Loss (train)         : {min(loss_history.kl_losses):.6f} (epoch {np.argmin(loss_history.kl_losses) + 1})\n\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("ADAPTIVE KL WEIGHT HISTORY (first/last 10 epochs)\n")
+        f.write("-" * 80 + "\n")
+        if adaptive_kl_history and adaptive_kl_history.get('epoch'):
+            n = len(adaptive_kl_history['epoch'])
+            idx_show = list(range(min(10, n))) + ([None] if n > 20 else []) + list(range(max(10, n - 10), n))
+            for i in idx_show:
+                if i is None:
+                    f.write("  ...\n")
+                    continue
+                f.write(f"  Epoch {adaptive_kl_history['epoch'][i]:4d}: "
+                        f"kl_loss={adaptive_kl_history['kl_loss'][i]:9.4f}  "
+                        f"kl_weight={adaptive_kl_history['kl_weight'][i]:.8f}  "
+                        f"{adaptive_kl_history['action'][i]}\n")
+            f.write("\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("TRADITIONAL METRICS (LAST EVALUATION)\n")
+        f.write("-" * 80 + "\n")
+
+        if hasattr(metrics_history, 'metrics'):
+            for key, values in metrics_history.metrics.items():
+                if values:
+                    f.write(f"  {key:<15}: {values[-1]:.4f}\n")
+            f.write("\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("GEOSTATISTICAL METRICS (LAST EVALUATION)\n")
+        f.write("-" * 80 + "\n")
+
+        if hasattr(metrics_history, 'static_metrics'):
+            for key, values in metrics_history.static_metrics.items():
+                if values:
+                    f.write(f"  {key:<20}: {values[-1]:.6f}\n")
+            f.write("\n")
+
+        if static_metrics_results:
+            f.write("-" * 80 + "\n")
+            f.write("FINAL GEOSTATISTICAL METRICS (POST-TRAINING)\n")
+            f.write("-" * 80 + "\n")
+            for key, value in static_metrics_results.items():
+                if isinstance(value, (int, float)):
+                    f.write(f"  {key:<25}: {value:.6f}\n")
+            f.write("\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("MODEL ARCHITECTURE\n")
+        f.write("-" * 80 + "\n")
+        f.write("  Encoder (VAE):\n")
+        f.write(f"    Input Shape        : ({ni}, {nj}, {nz})\n")
+        f.write(f"    Latent Dim         : {latent_dim}\n")
+        f.write("    Conv Layers        : 4 (32, 64, 128, 256 filters)\n")
+        f.write("    Dense Layer        : 256\n")
+        f.write("    Dropout            : 0.4 / 0.3\n")
+        f.write("    BatchNormalization : Yes\n")
+        f.write("    Output Heads       : z_mean, z_log_var\n\n")
+
+        f.write("  Decoder (softmax) — used in training:\n")
+        f.write(f"    Input Dim          : {latent_dim}\n")
+        f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
+        f.write(f"    Num Classes        : {num_classes}\n")
+        f.write("    Output Act         : softmax\n")
+        f.write(f"    Output Shape       : (None, {ni}, {nj}, {num_classes})\n\n")
+
+        f.write("  Decoder (continuous) — derived from softmax (NOT trained):\n")
+        f.write(f"    Input Dim          : {latent_dim}\n")
+        f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
+        f.write("    Output Act         : linear\n")
+        f.write(f"    Output Shape       : (None, {ni}, {nj}, 1)\n")
+        f.write("    Weights            : transferred from softmax via tensordot\n")
+        f.write("    Usage              : observation operator in run_assimilation\n")
+        if decoder_transfer_agreement is not None:
+            f.write(f"    Sanity check acc   : {decoder_transfer_agreement:.4f}\n")
+            f.write(f"    (agreement softmax+argmax vs continuous+round)\n")
+        f.write("\n")
+
+        f.write("  UNet (Diffusion, 1D):\n")
+        f.write(f"    Input Dim          : {latent_dim}\n")
+        f.write(f"    Time Emb Dim       : 256\n")
+        f.write("    Encoder Channels   : 64 / 128 / 256 / 512\n")
+        f.write("    Bottleneck Ch.     : 512 (x2 residual blocks)\n")
+        f.write("    Skip Connections   : Yes\n")
+        f.write("    Activation         : swish\n\n")
+
+        f.write("  Diffusion:\n")
+        f.write(f"    Timesteps          : {num_timesteps}\n")
+        f.write(f"    Beta Start         : {beta_start}\n")
+        f.write(f"    Beta End           : {beta_end}\n\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("FINAL SUMMARY\n")
+        f.write("-" * 80 + "\n")
+        f.write(
+            f"  Training status         : {'COMPLETED' if len(loss_history.total_losses) == epochs else 'INTERRUPTED (Early Stopping)'}\n")
+        f.write(f"  Epochs executed         : {len(loss_history.total_losses)}\n")
+        f.write(f"  Total time              : {execution_time / 3600:.2f} hours\n")
+        f.write(
+            f"  Average time per epoch  : {(execution_time / len(loss_history.total_losses)) if loss_history.total_losses else 0:.2f} seconds\n")
+        f.write(f"  Dataset                 : {name}\n")
+        f.write(f"  Training samples        : {len(x_train)}\n")
+        f.write(f"  Test samples            : {len(x_test)}\n")
+        f.write(f"  FID/FRD sampling        : {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples ({FID_N_BATCHES * FID_BATCH_SIZE} total)\n")
+        f.write(f"  Sample chunk size       : {SAMPLE_CHUNK_SIZE}\n")
+        f.write(f"  FID epsilon             : {FID_EPS}\n")
+        f.write(f"  Image generation        : Discrete (softmax + argmax)\n\n")
+
+        f.write("-" * 80 + "\n")
+        f.write("GENERATED FILES\n")
+        f.write("-" * 80 + "\n")
+        saved_files_list = [
+            "training_outputs/latent_diffusion_encoder_weights.h5",
+            "training_outputs/latent_diffusion_decoder_weights.h5",
+            "training_outputs/latent_diffusion_decoder_softmax_weights.h5",
+            "training_outputs/latent_diffusion_decoder_continuous_weights.h5",
+            "training_outputs/latent_diffusion_unet_weights.h5",
+            "training_outputs/latent_diffusion_model_weights.h5",
+            "training_outputs/latent_diffusion_encoder_model.h5",
+            "training_outputs/latent_diffusion_decoder_model.h5",
+            "training_outputs/latent_diffusion_decoder_softmax_model.h5",
+            "training_outputs/latent_diffusion_decoder_continuous_model.h5",
+            "training_outputs/latent_diffusion_unet_model.h5",
+            "training_outputs/latent_diffusion_best_weights.h5",
+            "training_outputs/latent_diffusion_loss_history.txt",
+            "training_outputs/latent_diffusion_training_metrics.txt",
+            "training_outputs/latent_diffusion_all_metrics.csv"
+        ]
+        for file in saved_files_list:
+            f.write(f"  - {file}\n")
+
+        f.write("\n" + "=" * 80 + "\n")
+        f.write("                    END OF REPORT\n")
+        f.write("=" * 80 + "\n")
+
+    print(f"\n✓ Final report saved to: {filepath}")
+
+
+def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=None,
+                                   sample_size=FID_SAMPLE_SIZE):
+    n_samples = min(sample_size, len(real_data))
+    fake_data = diffusion_model.sample(n_samples, training=False, verbose=False)
+    if isinstance(fake_data, tf.Tensor):
+        fake_data = fake_data.numpy()
+    if np.any(np.isnan(fake_data)):
+        fake_data = np.nan_to_num(fake_data, nan=0.0)
+    from sklearn.metrics.pairwise import rbf_kernel
+    metrics = {}
+    lags, variogram_real = StaticMetrics.variogram_2d_optimized(real_data[:100], max_lag=25)
+    _, variogram_fake = StaticMetrics.variogram_2d_optimized(fake_data[:100], max_lag=25)
+    metrics['variogram_mse'] = np.mean((variogram_real - variogram_fake) ** 2)
+    _, connectivity_real = StaticMetrics.connectivity_function(real_data[:100], 0.5, lag_distances=lags)
+    _, connectivity_fake = StaticMetrics.connectivity_function(fake_data[:100], 0.5, lag_distances=lags)
+    metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
+    real_flat = real_data.flatten()
+    fake_flat = fake_data.flatten()
+    all_data = np.concatenate([real_flat, fake_flat])
+    data_min, data_max = np.min(all_data), np.max(all_data)
+    hist_real, bin_edges = np.histogram(real_flat, bins=100, range=(data_min, data_max), density=False)
+    hist_fake, _ = np.histogram(fake_flat, bins=100, range=(data_min, data_max), density=False)
+    hist_real = hist_real.astype(float) / np.sum(hist_real)
+    hist_fake = hist_fake.astype(float) / np.sum(hist_fake)
+    epsilon = 1e-10
+    hist_real = np.clip(hist_real, epsilon, 1)
+    hist_fake = np.clip(hist_fake, epsilon, 1)
+    metrics['hist_kl'] = np.sum(hist_real * np.log(hist_real / hist_fake))
+    pca_real, _ = StaticMetrics.calculate_pca_features(real_data[:500])
+    pca_fake, _ = StaticMetrics.calculate_pca_features(fake_data[:500])
+    if pca_real.shape[0] == pca_fake.shape[0]:
+        n_components = min(2, pca_real.shape[1], pca_fake.shape[1])
+        pca_correlations = []
+        for i in range(n_components):
+            corr = np.corrcoef(pca_real[:, i], pca_fake[:, i])[0, 1]
+            pca_correlations.append(corr)
+        metrics['pca_correlation'] = np.mean(pca_correlations)
+    else:
+        metrics['pca_correlation'] = 0.0
+    mds_real = StaticMetrics.calculate_mds_features(real_data[:500])
+    mds_fake = StaticMetrics.calculate_mds_features(fake_data[:500])
+    n_samples_mds = min(len(mds_real), len(mds_fake), 100)
+    mds_real_small = mds_real[:n_samples_mds]
+    mds_fake_small = mds_fake[:n_samples_mds]
+    if len(mds_real_small) > 0 and len(mds_fake_small) > 0:
+        X = np.vstack([mds_real_small, mds_fake_small])
+        pairwise_dists = pdist(X)
+        gamma = 1.0 / (2.0 * np.median(pairwise_dists) ** 2) if len(pairwise_dists) > 0 else 1.0
+        K_XX = rbf_kernel(mds_real_small, mds_real_small, gamma=gamma)
+        K_YY = rbf_kernel(mds_fake_small, mds_fake_small, gamma=gamma)
+        K_XY = rbf_kernel(mds_real_small, mds_fake_small, gamma=gamma)
+        mmd_squared = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
+        metrics['mds_mmd'] = np.sqrt(max(mmd_squared, 0))
+    else:
+        metrics['mds_mmd'] = 0.0
+    figsize = (22 * HIGH_RES_CONFIG['figsize_multiplier'],
+               14 * HIGH_RES_CONFIG['figsize_multiplier'])
+    fig, axes = plt.subplots(2, 3, figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
+    fig.suptitle('Latent Diffusion: Static Geostatistical Metrics Comparison',
+                 fontsize=26, fontweight='bold', y=1.02)
+    axes[0, 0].plot(lags, variogram_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
+    axes[0, 0].plot(lags, variogram_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+    axes[0, 0].set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
+    axes[0, 0].set_ylabel('Variogram', fontweight='bold', fontsize=22)
+    axes[0, 0].set_title(f'Variogram (MSE: {metrics["variogram_mse"]:.4f})', fontweight='bold', fontsize=24)
+    axes[0, 0].legend(fontsize=18)
+    axes[0, 0].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    axes[0, 1].plot(lags, connectivity_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
+    axes[0, 1].plot(lags, connectivity_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+    axes[0, 1].set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
+    axes[0, 1].set_ylabel('Connectivity', fontweight='bold', fontsize=22)
+    axes[0, 1].set_title(f'Connectivity (MSE: {metrics["connectivity_mse"]:.4f})', fontweight='bold', fontsize=24)
+    axes[0, 1].legend(fontsize=18)
+    axes[0, 1].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bar_width = bin_centers[1] - bin_centers[0]
+    axes[0, 2].bar(bin_centers, hist_real, width=bar_width, alpha=0.6, label='Real', color='blue')
+    axes[0, 2].plot(bin_centers, hist_fake, 'r-', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+    axes[0, 2].set_xlabel('Value', fontweight='bold', fontsize=22)
+    axes[0, 2].set_ylabel('Density', fontweight='bold', fontsize=22)
+    axes[0, 2].set_title(f'Histogram (KL: {metrics["hist_kl"]:.4f})', fontweight='bold', fontsize=24)
+    axes[0, 2].legend(fontsize=18)
+    axes[0, 2].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    axes[1, 0].scatter(pca_real[:100, 0], pca_real[:100, 1], alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
+                       color='blue')
+    axes[1, 0].scatter(pca_fake[:100, 0], pca_fake[:100, 1], alpha=0.6, label='Generated',
+                       s=HIGH_RES_CONFIG['marker_size'], color='red')
+    axes[1, 0].set_xlabel('PC1', fontweight='bold', fontsize=22)
+    axes[1, 0].set_ylabel('PC2', fontweight='bold', fontsize=22)
+    axes[1, 0].set_title(f'PCA (Corr: {metrics["pca_correlation"]:.4f})', fontweight='bold', fontsize=24)
+    axes[1, 0].legend(fontsize=18)
+    axes[1, 0].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    axes[1, 1].scatter(mds_real[:100, 0], mds_real[:100, 1], alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
+                       color='blue')
+    axes[1, 1].scatter(mds_fake[:100, 0], mds_fake[:100, 1], alpha=0.6, label='Generated',
+                       s=HIGH_RES_CONFIG['marker_size'], color='red')
+    axes[1, 1].set_xlabel('MDS 1', fontweight='bold', fontsize=22)
+    axes[1, 1].set_ylabel('MDS 2', fontweight='bold', fontsize=22)
+    axes[1, 1].set_title(f'MDS (MMD: {metrics["mds_mmd"]:.4f})', fontweight='bold', fontsize=24)
+    axes[1, 1].legend(fontsize=18)
+    axes[1, 1].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    stats_text = (
+        f'Variogram MSE: {metrics["variogram_mse"]:.6f}\n'
+        f'Connectivity MSE: {metrics["connectivity_mse"]:.6f}\n'
+        f'Histogram KL: {metrics["hist_kl"]:.6f}\n'
+        f'PCA Correlation: {metrics["pca_correlation"]:.4f}\n'
+        f'MDS MMD: {metrics["mds_mmd"]:.4f}'
+    )
+    axes[1, 2].text(0.1, 0.5, stats_text, transform=axes[1, 2].transAxes,
+                    fontsize=18, verticalalignment='center',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    axes[1, 2].axis('off')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    if save_path_base:
+        saved_files = save_figure_multiple_formats(fig, save_path_base, HIGH_RES_CONFIG['dpi'])
+    else:
+        saved_files = []
+    plt.close(fig)
+    return metrics, saved_files
+
+
+# ============================================================================
+# 5. TRAINING
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 5.1 Callbacks
+# ----------------------------------------------------------------------------
+class ClearMemoryCallback(Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        gc.collect()
+        K.clear_session()
+
 
 class DistributionPlotCallback(tf.keras.callbacks.Callback):
     def __init__(self, model, test_data, plot_interval=10, save_interval=10):
@@ -1446,325 +1806,9 @@ class AdaptiveKLWeightCallback(tf.keras.callbacks.Callback):
                   f"kl_weight={current_weight:.8f} -> {new_weight:.8f}  {action}")
 
 
-def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=None,
-                                   sample_size=FID_SAMPLE_SIZE):
-    n_samples = min(sample_size, len(real_data))
-    fake_data = diffusion_model.sample(n_samples, training=False, verbose=False)
-    if isinstance(fake_data, tf.Tensor):
-        fake_data = fake_data.numpy()
-    if np.any(np.isnan(fake_data)):
-        fake_data = np.nan_to_num(fake_data, nan=0.0)
-    from sklearn.metrics.pairwise import rbf_kernel
-    metrics = {}
-    lags, variogram_real = StaticMetrics.variogram_2d_optimized(real_data[:100], max_lag=25)
-    _, variogram_fake = StaticMetrics.variogram_2d_optimized(fake_data[:100], max_lag=25)
-    metrics['variogram_mse'] = np.mean((variogram_real - variogram_fake) ** 2)
-    _, connectivity_real = StaticMetrics.connectivity_function(real_data[:100], 0.5, lag_distances=lags)
-    _, connectivity_fake = StaticMetrics.connectivity_function(fake_data[:100], 0.5, lag_distances=lags)
-    metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
-    real_flat = real_data.flatten()
-    fake_flat = fake_data.flatten()
-    all_data = np.concatenate([real_flat, fake_flat])
-    data_min, data_max = np.min(all_data), np.max(all_data)
-    hist_real, bin_edges = np.histogram(real_flat, bins=100, range=(data_min, data_max), density=False)
-    hist_fake, _ = np.histogram(fake_flat, bins=100, range=(data_min, data_max), density=False)
-    hist_real = hist_real.astype(float) / np.sum(hist_real)
-    hist_fake = hist_fake.astype(float) / np.sum(hist_fake)
-    epsilon = 1e-10
-    hist_real = np.clip(hist_real, epsilon, 1)
-    hist_fake = np.clip(hist_fake, epsilon, 1)
-    metrics['hist_kl'] = np.sum(hist_real * np.log(hist_real / hist_fake))
-    pca_real, _ = StaticMetrics.calculate_pca_features(real_data[:500])
-    pca_fake, _ = StaticMetrics.calculate_pca_features(fake_data[:500])
-    if pca_real.shape[0] == pca_fake.shape[0]:
-        n_components = min(2, pca_real.shape[1], pca_fake.shape[1])
-        pca_correlations = []
-        for i in range(n_components):
-            corr = np.corrcoef(pca_real[:, i], pca_fake[:, i])[0, 1]
-            pca_correlations.append(corr)
-        metrics['pca_correlation'] = np.mean(pca_correlations)
-    else:
-        metrics['pca_correlation'] = 0.0
-    mds_real = StaticMetrics.calculate_mds_features(real_data[:500])
-    mds_fake = StaticMetrics.calculate_mds_features(fake_data[:500])
-    n_samples_mds = min(len(mds_real), len(mds_fake), 100)
-    mds_real_small = mds_real[:n_samples_mds]
-    mds_fake_small = mds_fake[:n_samples_mds]
-    if len(mds_real_small) > 0 and len(mds_fake_small) > 0:
-        X = np.vstack([mds_real_small, mds_fake_small])
-        pairwise_dists = pdist(X)
-        gamma = 1.0 / (2.0 * np.median(pairwise_dists) ** 2) if len(pairwise_dists) > 0 else 1.0
-        K_XX = rbf_kernel(mds_real_small, mds_real_small, gamma=gamma)
-        K_YY = rbf_kernel(mds_fake_small, mds_fake_small, gamma=gamma)
-        K_XY = rbf_kernel(mds_real_small, mds_fake_small, gamma=gamma)
-        mmd_squared = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
-        metrics['mds_mmd'] = np.sqrt(max(mmd_squared, 0))
-    else:
-        metrics['mds_mmd'] = 0.0
-    figsize = (22 * HIGH_RES_CONFIG['figsize_multiplier'],
-               14 * HIGH_RES_CONFIG['figsize_multiplier'])
-    fig, axes = plt.subplots(2, 3, figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
-    fig.suptitle('Latent Diffusion: Static Geostatistical Metrics Comparison',
-                 fontsize=26, fontweight='bold', y=1.02)
-    axes[0, 0].plot(lags, variogram_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
-    axes[0, 0].plot(lags, variogram_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-    axes[0, 0].set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
-    axes[0, 0].set_ylabel('Variogram', fontweight='bold', fontsize=22)
-    axes[0, 0].set_title(f'Variogram (MSE: {metrics["variogram_mse"]:.4f})', fontweight='bold', fontsize=24)
-    axes[0, 0].legend(fontsize=18)
-    axes[0, 0].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    axes[0, 1].plot(lags, connectivity_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
-    axes[0, 1].plot(lags, connectivity_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-    axes[0, 1].set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
-    axes[0, 1].set_ylabel('Connectivity', fontweight='bold', fontsize=22)
-    axes[0, 1].set_title(f'Connectivity (MSE: {metrics["connectivity_mse"]:.4f})', fontweight='bold', fontsize=24)
-    axes[0, 1].legend(fontsize=18)
-    axes[0, 1].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    bar_width = bin_centers[1] - bin_centers[0]
-    axes[0, 2].bar(bin_centers, hist_real, width=bar_width, alpha=0.6, label='Real', color='blue')
-    axes[0, 2].plot(bin_centers, hist_fake, 'r-', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-    axes[0, 2].set_xlabel('Value', fontweight='bold', fontsize=22)
-    axes[0, 2].set_ylabel('Density', fontweight='bold', fontsize=22)
-    axes[0, 2].set_title(f'Histogram (KL: {metrics["hist_kl"]:.4f})', fontweight='bold', fontsize=24)
-    axes[0, 2].legend(fontsize=18)
-    axes[0, 2].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    axes[1, 0].scatter(pca_real[:100, 0], pca_real[:100, 1], alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
-                       color='blue')
-    axes[1, 0].scatter(pca_fake[:100, 0], pca_fake[:100, 1], alpha=0.6, label='Generated',
-                       s=HIGH_RES_CONFIG['marker_size'], color='red')
-    axes[1, 0].set_xlabel('PC1', fontweight='bold', fontsize=22)
-    axes[1, 0].set_ylabel('PC2', fontweight='bold', fontsize=22)
-    axes[1, 0].set_title(f'PCA (Corr: {metrics["pca_correlation"]:.4f})', fontweight='bold', fontsize=24)
-    axes[1, 0].legend(fontsize=18)
-    axes[1, 0].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    axes[1, 1].scatter(mds_real[:100, 0], mds_real[:100, 1], alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
-                       color='blue')
-    axes[1, 1].scatter(mds_fake[:100, 0], mds_fake[:100, 1], alpha=0.6, label='Generated',
-                       s=HIGH_RES_CONFIG['marker_size'], color='red')
-    axes[1, 1].set_xlabel('MDS 1', fontweight='bold', fontsize=22)
-    axes[1, 1].set_ylabel('MDS 2', fontweight='bold', fontsize=22)
-    axes[1, 1].set_title(f'MDS (MMD: {metrics["mds_mmd"]:.4f})', fontweight='bold', fontsize=24)
-    axes[1, 1].legend(fontsize=18)
-    axes[1, 1].grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    stats_text = (
-        f'Variogram MSE: {metrics["variogram_mse"]:.6f}\n'
-        f'Connectivity MSE: {metrics["connectivity_mse"]:.6f}\n'
-        f'Histogram KL: {metrics["hist_kl"]:.6f}\n'
-        f'PCA Correlation: {metrics["pca_correlation"]:.4f}\n'
-        f'MDS MMD: {metrics["mds_mmd"]:.4f}'
-    )
-    axes[1, 2].text(0.1, 0.5, stats_text, transform=axes[1, 2].transAxes,
-                    fontsize=18, verticalalignment='center',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    axes[1, 2].axis('off')
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    if save_path_base:
-        saved_files = save_figure_multiple_formats(fig, save_path_base, HIGH_RES_CONFIG['dpi'])
-    else:
-        saved_files = []
-    plt.close(fig)
-    return metrics, saved_files
-
-
-# ==============================================
-# FINAL TRAINING REPORT FUNCTION
-# ==============================================
-def generate_final_report(filepath, params, execution_time, loss_history, metrics_history,
-                          static_metrics_results, adaptive_kl_history=None,
-                          decoder_transfer_agreement=None):
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write("=" * 80 + "\n")
-        f.write("               FINAL LATENT DIFFUSION TRAINING REPORT\n")
-        f.write("=" * 80 + "\n\n")
-
-        f.write(f"Date/Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-
-        f.write("-" * 80 + "\n")
-        f.write("TRAINING PARAMETERS\n")
-        f.write("-" * 80 + "\n")
-        for key, value in params.items():
-            f.write(f"  {key:<35}: {value}\n")
-        f.write("\n")
-
-        f.write("-" * 80 + "\n")
-        f.write("EXECUTION TIME\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"  Total Time (seconds) : {execution_time:.2f}s\n")
-        f.write(f"  Total Time (minutes) : {execution_time / 60:.2f}min\n")
-        f.write(f"  Total Time (hours)   : {execution_time / 3600:.2f}h\n\n")
-
-        f.write("-" * 80 + "\n")
-        f.write("TRAINING METRICS (FINAL VALUES)\n")
-        f.write("-" * 80 + "\n")
-
-        if loss_history.total_losses:
-            last_epoch = len(loss_history.total_losses)
-            f.write(f"  Total epochs trained: {last_epoch}\n\n")
-            f.write("  Training Losses (last epoch):\n")
-            f.write(f"    Total Loss       : {loss_history.total_losses[-1]:.6f}\n")
-            f.write(f"    Diffusion Loss   : {loss_history.diffusion_losses[-1]:.6f}\n")
-            f.write(f"    Reconstruction   : {loss_history.recon_losses[-1]:.6f}\n")
-            f.write(f"    KL Loss          : {loss_history.kl_losses[-1]:.6f}\n\n")
-
-            f.write("  Validation Losses (last epoch):\n")
-            f.write(f"    Total Loss       : {loss_history.val_total_losses[-1]:.6f}\n")
-            f.write(f"    Diffusion Loss   : {loss_history.val_diffusion_losses[-1]:.6f}\n")
-            f.write(f"    Reconstruction   : {loss_history.val_recon_losses[-1]:.6f}\n")
-            f.write(f"    KL Loss          : {loss_history.val_kl_losses[-1]:.6f}\n\n")
-
-            f.write("  Best values during training:\n")
-            f.write(
-                f"    Lowest Total Loss (train)      : {min(loss_history.total_losses):.6f} (epoch {np.argmin(loss_history.total_losses) + 1})\n")
-            f.write(
-                f"    Lowest Total Loss (val)        : {min(loss_history.val_total_losses):.6f} (epoch {np.argmin(loss_history.val_total_losses) + 1})\n")
-            f.write(
-                f"    Lowest Diffusion Loss (train)  : {min(loss_history.diffusion_losses):.6f} (epoch {np.argmin(loss_history.diffusion_losses) + 1})\n")
-            f.write(
-                f"    Lowest Recon Loss (train)      : {min(loss_history.recon_losses):.6f} (epoch {np.argmin(loss_history.recon_losses) + 1})\n")
-            f.write(
-                f"    Lowest KL Loss (train)         : {min(loss_history.kl_losses):.6f} (epoch {np.argmin(loss_history.kl_losses) + 1})\n\n")
-
-        f.write("-" * 80 + "\n")
-        f.write("ADAPTIVE KL WEIGHT HISTORY (first/last 10 epochs)\n")
-        f.write("-" * 80 + "\n")
-        if adaptive_kl_history and adaptive_kl_history.get('epoch'):
-            n = len(adaptive_kl_history['epoch'])
-            idx_show = list(range(min(10, n))) + ([None] if n > 20 else []) + list(range(max(10, n - 10), n))
-            for i in idx_show:
-                if i is None:
-                    f.write("  ...\n")
-                    continue
-                f.write(f"  Epoch {adaptive_kl_history['epoch'][i]:4d}: "
-                        f"kl_loss={adaptive_kl_history['kl_loss'][i]:9.4f}  "
-                        f"kl_weight={adaptive_kl_history['kl_weight'][i]:.8f}  "
-                        f"{adaptive_kl_history['action'][i]}\n")
-            f.write("\n")
-
-        f.write("-" * 80 + "\n")
-        f.write("TRADITIONAL METRICS (LAST EVALUATION)\n")
-        f.write("-" * 80 + "\n")
-
-        if hasattr(metrics_history, 'metrics'):
-            for key, values in metrics_history.metrics.items():
-                if values:
-                    f.write(f"  {key:<15}: {values[-1]:.4f}\n")
-            f.write("\n")
-
-        f.write("-" * 80 + "\n")
-        f.write("GEOSTATISTICAL METRICS (LAST EVALUATION)\n")
-        f.write("-" * 80 + "\n")
-
-        if hasattr(metrics_history, 'static_metrics'):
-            for key, values in metrics_history.static_metrics.items():
-                if values:
-                    f.write(f"  {key:<20}: {values[-1]:.6f}\n")
-            f.write("\n")
-
-        if static_metrics_results:
-            f.write("-" * 80 + "\n")
-            f.write("FINAL GEOSTATISTICAL METRICS (POST-TRAINING)\n")
-            f.write("-" * 80 + "\n")
-            for key, value in static_metrics_results.items():
-                if isinstance(value, (int, float)):
-                    f.write(f"  {key:<25}: {value:.6f}\n")
-            f.write("\n")
-
-        f.write("-" * 80 + "\n")
-        f.write("MODEL ARCHITECTURE\n")
-        f.write("-" * 80 + "\n")
-        f.write("  Encoder (VAE):\n")
-        f.write(f"    Input Shape        : ({ni}, {nj}, {nz})\n")
-        f.write(f"    Latent Dim         : {latent_dim}\n")
-        f.write("    Conv Layers        : 4 (32, 64, 128, 256 filters)\n")
-        f.write("    Dense Layer        : 256\n")
-        f.write("    Dropout            : 0.4 / 0.3\n")
-        f.write("    BatchNormalization : Yes\n")
-        f.write("    Output Heads       : z_mean, z_log_var\n\n")
-
-        f.write("  Decoder (softmax) — used in training:\n")
-        f.write(f"    Input Dim          : {latent_dim}\n")
-        f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
-        f.write(f"    Num Classes        : {num_classes}\n")
-        f.write("    Output Act         : softmax\n")
-        f.write(f"    Output Shape       : (None, {ni}, {nj}, {num_classes})\n\n")
-
-        f.write("  Decoder (continuous) — derived from softmax (NOT trained):\n")
-        f.write(f"    Input Dim          : {latent_dim}\n")
-        f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
-        f.write("    Output Act         : linear\n")
-        f.write(f"    Output Shape       : (None, {ni}, {nj}, 1)\n")
-        f.write("    Weights            : transferred from softmax via tensordot\n")
-        f.write("    Usage              : observation operator in run_assimilation\n")
-        if decoder_transfer_agreement is not None:
-            f.write(f"    Sanity check acc   : {decoder_transfer_agreement:.4f}\n")
-            f.write(f"    (agreement softmax+argmax vs continuous+round)\n")
-        f.write("\n")
-
-        f.write("  UNet (Diffusion, 1D):\n")
-        f.write(f"    Input Dim          : {latent_dim}\n")
-        f.write(f"    Time Emb Dim       : 256\n")
-        f.write("    Encoder Channels   : 64 / 128 / 256 / 512\n")
-        f.write("    Bottleneck Ch.     : 512 (x2 residual blocks)\n")
-        f.write("    Skip Connections   : Yes\n")
-        f.write("    Activation         : swish\n\n")
-
-        f.write("  Diffusion:\n")
-        f.write(f"    Timesteps          : {num_timesteps}\n")
-        f.write(f"    Beta Start         : {beta_start}\n")
-        f.write(f"    Beta End           : {beta_end}\n\n")
-
-        f.write("-" * 80 + "\n")
-        f.write("FINAL SUMMARY\n")
-        f.write("-" * 80 + "\n")
-        f.write(
-            f"  Training status         : {'COMPLETED' if len(loss_history.total_losses) == epochs else 'INTERRUPTED (Early Stopping)'}\n")
-        f.write(f"  Epochs executed         : {len(loss_history.total_losses)}\n")
-        f.write(f"  Total time              : {execution_time / 3600:.2f} hours\n")
-        f.write(
-            f"  Average time per epoch  : {(execution_time / len(loss_history.total_losses)) if loss_history.total_losses else 0:.2f} seconds\n")
-        f.write(f"  Dataset                 : {name}\n")
-        f.write(f"  Training samples        : {len(x_train)}\n")
-        f.write(f"  Test samples            : {len(x_test)}\n")
-        f.write(f"  FID/FRD sampling        : {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples ({FID_N_BATCHES * FID_BATCH_SIZE} total)\n")
-        f.write(f"  Sample chunk size       : {SAMPLE_CHUNK_SIZE}\n")
-        f.write(f"  FID epsilon             : {FID_EPS}\n")
-        f.write(f"  Image generation        : Discrete (softmax + argmax)\n\n")
-
-        f.write("-" * 80 + "\n")
-        f.write("GENERATED FILES\n")
-        f.write("-" * 80 + "\n")
-        saved_files_list = [
-            "training_outputs/latent_diffusion_encoder_weights.h5",
-            "training_outputs/latent_diffusion_decoder_weights.h5",
-            "training_outputs/latent_diffusion_decoder_softmax_weights.h5",
-            "training_outputs/latent_diffusion_decoder_continuous_weights.h5",
-            "training_outputs/latent_diffusion_unet_weights.h5",
-            "training_outputs/latent_diffusion_model_weights.h5",
-            "training_outputs/latent_diffusion_encoder_model.h5",
-            "training_outputs/latent_diffusion_decoder_model.h5",
-            "training_outputs/latent_diffusion_decoder_softmax_model.h5",
-            "training_outputs/latent_diffusion_decoder_continuous_model.h5",
-            "training_outputs/latent_diffusion_unet_model.h5",
-            "training_outputs/latent_diffusion_best_weights.h5",
-            "training_outputs/latent_diffusion_loss_history.txt",
-            "training_outputs/latent_diffusion_training_metrics.txt",
-            "training_outputs/latent_diffusion_all_metrics.csv"
-        ]
-        for file in saved_files_list:
-            f.write(f"  - {file}\n")
-
-        f.write("\n" + "=" * 80 + "\n")
-        f.write("                    END OF REPORT\n")
-        f.write("=" * 80 + "\n")
-
-    print(f"\n✓ Final report saved to: {filepath}")
-
-
-# ==============================================
-# TRAINING
-# ==============================================
-
+# ----------------------------------------------------------------------------
+# 5.2 Training setup and execution
+# ----------------------------------------------------------------------------
 os.makedirs('training_outputs', exist_ok=True)
 
 train_dataset = tf.data.Dataset.from_tensor_slices((x_train.astype('float32'), x_train.astype('float32'))).shuffle(
@@ -1859,9 +1903,9 @@ execution_time = end_time - start_time
 print(f"\n[INFO] Training completed in {execution_time / 3600:.2f} hours")
 
 
-# ==============================================
-# TRANSFER AND SAVING OF THE TWO DECODERS
-# ==============================================
+# ============================================================================
+# 6. EVALUATION & PLOTS
+# ============================================================================
 
 print("\n" + "=" * 60)
 print("TRANSFERRING WEIGHTS: softmax → continuous")
@@ -1877,11 +1921,6 @@ print("Transfer completed.")
 transfer_agreement = sanity_check_decoders(
     encoder, decoder_softmax, decoder_continuous, x_test, n=20
 )
-
-
-# ==============================================
-# FINAL ANALYSIS AND SAVING
-# ==============================================
 
 print("\n" + "=" * 60)
 print("FINAL ANALYSIS AND SAVING")
@@ -1923,7 +1962,14 @@ static_metrics_results, saved_static_files = plot_static_metrics_comparison(
     sample_size=FID_SAMPLE_SIZE,
 )
 
-# Save loss history
+
+# ============================================================================
+# 7. SAVING
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 7.1 Loss history files
+# ----------------------------------------------------------------------------
 with open('training_outputs/latent_diffusion_loss_history.txt', 'w') as f:
     f.write("Epoch\tTotal_Loss\tDiffusion_Loss\tRecon_Loss\tKL_Loss\t"
             "Val_Total_Loss\tVal_Diffusion_Loss\tVal_Recon_Loss\tVal_KL_Loss\n")
@@ -1948,9 +1994,9 @@ if adaptive_kl_callback.history['epoch']:
     adaptive_df.to_csv('training_outputs/latent_diffusion_adaptive_kl_history.csv', index=False)
     print(f"Adaptive KL history saved to training_outputs/latent_diffusion_adaptive_kl_history.csv")
 
-# ==============================================
-# SAVE WEIGHTS — encoder, unet, model, softmax and continuous
-# ==============================================
+# ----------------------------------------------------------------------------
+# 7.2 Model weights
+# ----------------------------------------------------------------------------
 print("Saving model weights...")
 encoder.save_weights('training_outputs/latent_diffusion_encoder_weights.h5')
 decoder_softmax.save_weights('training_outputs/latent_diffusion_decoder_softmax_weights.h5')
@@ -1960,6 +2006,9 @@ decoder_softmax.save_weights('training_outputs/latent_diffusion_decoder_weights.
 unet.save_weights('training_outputs/latent_diffusion_unet_weights.h5')
 diffusion_model.save_weights('training_outputs/latent_diffusion_model_weights.h5')
 
+# ----------------------------------------------------------------------------
+# 7.3 Full models
+# ----------------------------------------------------------------------------
 print("Saving models...")
 encoder.save('training_outputs/latent_diffusion_encoder_model.h5')
 decoder_softmax.save('training_outputs/latent_diffusion_decoder_softmax_model.h5')
@@ -1973,11 +2022,9 @@ print("  - latent_diffusion_decoder_softmax_model.h5       (softmax, (48,48,3)) 
 print("  - latent_diffusion_decoder_continuous_model.h5    (linear, (48,48,1)) — USE IN run_assimilation")
 print("  - latent_diffusion_decoder_model.h5               (alias = softmax; legacy)")
 
-
-# ==============================================
-# GENERATE AND SAVE FINAL REPORT
-# ==============================================
-
+# ----------------------------------------------------------------------------
+# 7.4 Final report
+# ----------------------------------------------------------------------------
 training_params = {
     'Dataset': name,
     'Encoder type': 'VAE (z_mean + z_log_var + reparameterization)',
@@ -2035,6 +2082,9 @@ generate_final_report(
     decoder_transfer_agreement=transfer_agreement,
 )
 
+# ----------------------------------------------------------------------------
+# 7.5 Final summary
+# ----------------------------------------------------------------------------
 print("\n" + "=" * 60)
 print("TRAINING COMPLETED SUCCESSFULLY")
 print("=" * 60)
