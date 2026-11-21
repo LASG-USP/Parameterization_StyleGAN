@@ -1,18 +1,4 @@
 # ============================================================================
-# STYLEGAN2 WITH GAUSSIAN LATENT SPACE FOR GEOSTATISTICAL FACIES MODELING
-# ============================================================================
-# Standard deep learning pipeline structure:
-#   1. IMPORTS & CONFIGURATION
-#   2. DATA LOADING & PREPROCESSING
-#   3. MODEL ARCHITECTURE
-#   4. METRICS & UTILITIES
-#   5. TRAINING
-#   6. EVALUATION & PLOTS
-#   7. SAVING
-# ============================================================================
-
-
-# ============================================================================
 # 1. IMPORTS & CONFIGURATION
 # ============================================================================
 
