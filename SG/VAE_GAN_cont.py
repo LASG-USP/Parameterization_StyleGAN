@@ -1,36 +1,38 @@
+# ============================================================================
+# 1. IMPORTS & CONFIGURATION
+# ============================================================================
+
+import os
+import gc
+import time
+import pickle
+import warnings
+
 import numpy as np
+import pandas as pd
+import psutil
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
-import matplotlib.pyplot as plt
+from tensorflow.keras import layers, backend as K
 from tensorflow.keras.layers import LeakyReLU
 from tensorflow.keras.models import load_model
-from random import random
+from tensorflow.keras.callbacks import Callback
 from keras.applications.inception_v3 import InceptionV3
-from scipy.stats import gaussian_kde
 from PIL import Image
-import pickle
-import time
-import os
-import seaborn as sns
-import pandas as pd
+
+from scipy.linalg import sqrtm
+from scipy.spatial.distance import pdist
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS
-from scipy.spatial.distance import pdist, squareform
-import gc
-from tensorflow.keras import backend as K
-from tensorflow.keras.callbacks import Callback
-from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
-import psutil
+
 from metrics import *
 
-class ClearMemoryCallback(Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        gc.collect()
-        K.clear_session()
-
-# Configuration parameters
+# ----------------------------------------------------------------------------
+# Global configuration
+# ----------------------------------------------------------------------------
 zdim = 512
 epochs = 150
 metric_interval = 10
@@ -57,6 +59,31 @@ HIGH_RES_CONFIG = {
     'save_formats': ['png', 'svg']
 }
 
+# ----------------------------------------------------------------------------
+# Environment setup
+# ----------------------------------------------------------------------------
+warnings.filterwarnings('ignore')
+
+tf.keras.backend.clear_session()
+gc.collect()
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"Available GPUs: {len(gpus)}")
+    except RuntimeError as e:
+        print(e)
+
+os.makedirs('training_outputs', exist_ok=True)
+print("Directory 'training_outputs' created/verified.")
+
+
+# ============================================================================
+# 2. DATA LOADING & PREPROCESSING
+# ============================================================================
+
 # Load dataset
 if name == 'channel2d_large':
     X_train = np.load('datasets/Two_facies_channel_2d.npy').astype('float')
@@ -80,12 +107,187 @@ x_test = X_train[train_size:]
 
 latent_dim = zdim
 
+print(f"Data shape: {X_train.shape}")
+print(f"Train: {x_train.shape}, Test: {x_test.shape}")
+print(f"Data type: {X_train.dtype}")
 
-# ============================================================
-# FID FIX: stable frechet_distance (overrides metrics.frechet_distance)
-# ============================================================
-from scipy.linalg import sqrtm
 
+# ============================================================================
+# 3. MODEL ARCHITECTURE
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 3.1 Encoder
+# ----------------------------------------------------------------------------
+def build_encoder(input_shape, latent_dim):
+    inputs = keras.Input(shape=input_shape)
+    x = layers.Conv2D(32, 3, strides=2, padding="same")(inputs)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Conv2D(64, 3, strides=2, padding="same")(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Conv2D(128, 3, strides=2, padding="same")(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Flatten()(x)
+    x = layers.Dense(32)(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Dropout(0.2)(x)
+    z_mean = layers.Dense(latent_dim, name="z_mean")(x)
+    z_log_var = layers.Dense(latent_dim, name="z_log_var")(x)
+
+    def sampling(args):
+        z_mean, z_log_var = args
+        batch = tf.shape(z_mean)[0]
+        dim = tf.shape(z_mean)[1]
+        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+    z = layers.Lambda(sampling, output_shape=(latent_dim,), name="z")([z_mean, z_log_var])
+    return keras.Model(inputs, [z_mean, z_log_var, z], name="encoder")
+
+
+# ----------------------------------------------------------------------------
+# 3.2 Decoder
+# ----------------------------------------------------------------------------
+def build_decoder(latent_dim):
+    latent_inputs = keras.Input(shape=(latent_dim,))
+    x = layers.Dense(6 * 6 * 128)(latent_inputs)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Reshape((6, 6, 128))(x)
+    x = layers.Conv2DTranspose(128, 3, strides=2, padding="same")(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Conv2DTranspose(64, 3, strides=2, padding="same")(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Conv2DTranspose(32, 3, strides=2, padding="same")(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    outputs = layers.Conv2DTranspose(1, 3, activation="tanh", padding="same")(x)
+    return keras.Model(latent_inputs, outputs, name="decoder")
+
+
+# ----------------------------------------------------------------------------
+# 3.3 Discriminator
+# ----------------------------------------------------------------------------
+def build_discriminator(input_shape):
+    inputs = keras.Input(shape=input_shape)
+    x = layers.Conv2D(32, 3, strides=2, padding="same")(inputs)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Conv2D(64, 3, strides=2, padding="same")(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Conv2D(128, 3, strides=2, padding="same")(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Flatten()(x)
+    x = layers.Dense(1, activation="sigmoid")(x)
+    return keras.Model(inputs, x, name="discriminator")
+
+
+# ----------------------------------------------------------------------------
+# 3.4 Build model instances
+# ----------------------------------------------------------------------------
+encoder = build_encoder((ni, nj, nz), latent_dim)
+decoder = build_decoder(latent_dim)
+discriminator = build_discriminator((ni, nj, nz))
+
+
+# ----------------------------------------------------------------------------
+# 3.5 VAE-GAN composite model
+# ----------------------------------------------------------------------------
+class VAEGAN(keras.Model):
+    def __init__(self, encoder, decoder, discriminator, **kwargs):
+        super(VAEGAN, self).__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.discriminator = discriminator
+        self.discriminator.trainable = False
+
+    def call(self, inputs):
+        z_mean, z_log_var, z = self.encoder(inputs)
+        reconstructed = self.decoder(z)
+        return reconstructed
+
+    def train_step(self, data):
+        real_images = data[0]
+        batch_size = tf.shape(real_images)[0]
+
+        self.discriminator.trainable = True
+
+        with tf.GradientTape() as disc_tape:
+            z_mean, z_log_var, z = self.encoder(real_images, training=True)
+            fake_images = self.decoder(z, training=True)
+            real_preds = self.discriminator(real_images, training=True)
+            fake_preds = self.discriminator(fake_images, training=True)
+            real_labels = tf.ones_like(real_preds)
+            fake_labels = tf.zeros_like(fake_preds)
+            d_loss_real = tf.reduce_mean(keras.losses.mean_squared_error(real_labels, real_preds))
+            d_loss_fake = tf.reduce_mean(keras.losses.mean_squared_error(fake_labels, fake_preds))
+            d_loss = 0.5 * (d_loss_real + d_loss_fake)
+
+        d_gradients = disc_tape.gradient(d_loss, self.discriminator.trainable_variables)
+        self.discriminator.optimizer.apply_gradients(zip(d_gradients, self.discriminator.trainable_variables))
+
+        self.discriminator.trainable = False
+
+        with tf.GradientTape() as gen_tape:
+            z_mean, z_log_var, z = self.encoder(real_images, training=True)
+            fake_images = self.decoder(z, training=True)
+            recon_loss = tf.reduce_mean(keras.losses.mean_squared_error(real_images, fake_images))
+            kl_loss = -0.5 * tf.reduce_mean(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
+            vae_loss = recon_loss + beta * kl_loss
+            fake_preds = self.discriminator(fake_images, training=False)
+            target_score = 0.9
+            misleading_labels = tf.ones_like(fake_preds) * target_score
+            g_loss = tf.reduce_mean(keras.losses.mean_squared_error(misleading_labels, fake_preds))
+            g_weight = 0.5
+            total_gen_loss = vae_loss + g_weight * g_loss
+
+        trainable_vars = self.encoder.trainable_variables + self.decoder.trainable_variables
+        g_gradients = gen_tape.gradient(total_gen_loss, trainable_vars)
+        self.optimizer.apply_gradients(zip(g_gradients, trainable_vars))
+
+        self.compiled_metrics.update_state(real_images, fake_images)
+        metrics = {m.name: m.result() for m in self.metrics}
+        metrics.update({
+            "loss": total_gen_loss,
+            "recon_loss": recon_loss,
+            "kl_loss": kl_loss,
+            "d_loss": d_loss,
+            "g_loss": g_loss,
+            "d_loss_real": d_loss_real,
+            "d_loss_fake": d_loss_fake
+        })
+        return metrics
+
+    def test_step(self, data):
+        if isinstance(data, tuple):
+            real_images = data[0]
+        else:
+            real_images = data
+        z_mean, z_log_var, z = self.encoder(real_images, training=False)
+        fake_images = self.decoder(z, training=False)
+        recon_loss = tf.reduce_mean(keras.losses.mean_squared_error(real_images, fake_images))
+        kl_loss = -0.5 * tf.reduce_mean(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
+        vae_loss = recon_loss + beta * kl_loss
+        target_score = 0.9
+        fake_preds = self.discriminator(fake_images, training=False)
+        misleading_labels = tf.ones_like(fake_preds) * target_score
+        g_loss = tf.reduce_mean(keras.losses.mean_squared_error(misleading_labels, fake_preds))
+        total_loss = vae_loss + 0.5 * g_loss
+        return {
+            "loss": total_loss,
+            "recon_loss": recon_loss,
+            "kl_loss": kl_loss,
+            "g_loss": g_loss
+        }
+
+
+vae_gan = VAEGAN(encoder, decoder, discriminator)
+
+
+# ============================================================================
+# 4. METRICS & UTILITIES
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 4.1 Numerically stable Frechet Distance (FID fix)
+# ----------------------------------------------------------------------------
 def frechet_distance(features1, features2, eps=1e-6):
     """
     Numerically stable version of FID.
@@ -155,9 +357,12 @@ def frechet_distance(features1, features2, eps=1e-6):
     return max(fid, 0.0)
 
 
+# ----------------------------------------------------------------------------
+# 4.2 Batched Frechet Distance (10 batches x 1000 samples)
+# ----------------------------------------------------------------------------
 def frechet_distance_batched(real_features, fake_features,
-                              n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE,
-                              eps=1e-6):
+                             n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE,
+                             eps=1e-6):
     """
     Computes the Frechet Distance using batched computation over 10 batches of 1000 samples.
     Accumulates the statistics (mean and covariance) incrementally between batches,
@@ -259,10 +464,9 @@ def frechet_distance_batched(real_features, fake_features,
     return max(fid, 0.0)
 
 
-# Clear TensorFlow session
-tf.keras.backend.clear_session()
-
-
+# ----------------------------------------------------------------------------
+# 4.3 Feature extractors
+# ----------------------------------------------------------------------------
 def get_classifier(filepath):
     RC_full = tf.keras.models.load_model(filepath)
     f_extraction = keras.Model(inputs=RC_full.input,
@@ -275,6 +479,9 @@ def get_inception(shape):
     return iv3
 
 
+# ----------------------------------------------------------------------------
+# 4.4 Memory optimizer
+# ----------------------------------------------------------------------------
 class MemoryOptimizer:
     @staticmethod
     def memory_usage():
@@ -302,6 +509,9 @@ class MemoryOptimizer:
         return False
 
 
+# ----------------------------------------------------------------------------
+# 4.5 Static geostatistical metrics
+# ----------------------------------------------------------------------------
 class StaticMetrics:
     @staticmethod
     def variogram_2d(data, lag_distances=None, max_lag=None):
@@ -480,198 +690,9 @@ class StaticMetrics:
         return metrics
 
 
-# ==============================================
-# VAE-GAN
-# ==============================================
-
-
-def build_encoder(input_shape, latent_dim):
-    inputs = keras.Input(shape=input_shape)
-    x = layers.Conv2D(32, 3, strides=2, padding="same")(inputs)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Conv2D(64, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Conv2D(128, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Flatten()(x)
-    x = layers.Dense(32)(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.2)(x)
-    z_mean = layers.Dense(latent_dim, name="z_mean")(x)
-    z_log_var = layers.Dense(latent_dim, name="z_log_var")(x)
-
-    def sampling(args):
-        z_mean, z_log_var = args
-        batch = tf.shape(z_mean)[0]
-        dim = tf.shape(z_mean)[1]
-        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
-        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
-
-    z = layers.Lambda(sampling, output_shape=(latent_dim,), name="z")([z_mean, z_log_var])
-    return keras.Model(inputs, [z_mean, z_log_var, z], name="encoder")
-
-
-encoder = build_encoder((ni, nj, nz), latent_dim)
-
-
-def build_decoder(latent_dim):
-    latent_inputs = keras.Input(shape=(latent_dim,))
-    x = layers.Dense(6 * 6 * 128)(latent_inputs)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Reshape((6, 6, 128))(x)
-    x = layers.Conv2DTranspose(128, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Conv2DTranspose(64, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Conv2DTranspose(32, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    outputs = layers.Conv2DTranspose(1, 3, activation="tanh", padding="same")(x)
-    return keras.Model(latent_inputs, outputs, name="decoder")
-
-
-decoder = build_decoder(latent_dim)
-
-
-def build_discriminator(input_shape):
-    inputs = keras.Input(shape=input_shape)
-    x = layers.Conv2D(32, 3, strides=2, padding="same")(inputs)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Conv2D(64, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Conv2D(128, 3, strides=2, padding="same")(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Flatten()(x)
-    x = layers.Dense(1, activation="sigmoid")(x)
-    return keras.Model(inputs, x, name="discriminator")
-
-
-discriminator = build_discriminator((ni, nj, nz))
-
-# Initialize models
-encoder = build_encoder((ni, nj, nz), latent_dim)
-decoder = build_decoder(latent_dim)
-discriminator = build_discriminator((ni, nj, nz))
-
-
-class VAEGAN(keras.Model):
-    def __init__(self, encoder, decoder, discriminator, **kwargs):
-        super(VAEGAN, self).__init__(**kwargs)
-        self.encoder = encoder
-        self.decoder = decoder
-        self.discriminator = discriminator
-        self.discriminator.trainable = False
-
-    def call(self, inputs):
-        z_mean, z_log_var, z = self.encoder(inputs)
-        reconstructed = self.decoder(z)
-        return reconstructed
-
-    def train_step(self, data):
-        real_images = data[0]
-        batch_size = tf.shape(real_images)[0]
-
-        self.discriminator.trainable = True
-
-        with tf.GradientTape() as disc_tape:
-            z_mean, z_log_var, z = self.encoder(real_images, training=True)
-            fake_images = self.decoder(z, training=True)
-            real_preds = self.discriminator(real_images, training=True)
-            fake_preds = self.discriminator(fake_images, training=True)
-            real_labels = tf.ones_like(real_preds)
-            fake_labels = tf.zeros_like(fake_preds)
-            d_loss_real = tf.reduce_mean(keras.losses.mean_squared_error(real_labels, real_preds))
-            d_loss_fake = tf.reduce_mean(keras.losses.mean_squared_error(fake_labels, fake_preds))
-            d_loss = 0.5 * (d_loss_real + d_loss_fake)
-
-        d_gradients = disc_tape.gradient(d_loss, self.discriminator.trainable_variables)
-        self.discriminator.optimizer.apply_gradients(zip(d_gradients, self.discriminator.trainable_variables))
-
-        self.discriminator.trainable = False
-
-        with tf.GradientTape() as gen_tape:
-            z_mean, z_log_var, z = self.encoder(real_images, training=True)
-            fake_images = self.decoder(z, training=True)
-            recon_loss = tf.reduce_mean(keras.losses.mean_squared_error(real_images, fake_images))
-            kl_loss = -0.5 * tf.reduce_mean(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-            vae_loss = recon_loss + beta * kl_loss
-            fake_preds = self.discriminator(fake_images, training=False)
-            target_score = 0.9
-            misleading_labels = tf.ones_like(fake_preds) * target_score
-            g_loss = tf.reduce_mean(keras.losses.mean_squared_error(misleading_labels, fake_preds))
-            g_weight = 0.5
-            total_gen_loss = vae_loss + g_weight * g_loss
-
-        trainable_vars = self.encoder.trainable_variables + self.decoder.trainable_variables
-        g_gradients = gen_tape.gradient(total_gen_loss, trainable_vars)
-        self.optimizer.apply_gradients(zip(g_gradients, trainable_vars))
-
-        self.compiled_metrics.update_state(real_images, fake_images)
-        metrics = {m.name: m.result() for m in self.metrics}
-        metrics.update({
-            "loss": total_gen_loss,
-            "recon_loss": recon_loss,
-            "kl_loss": kl_loss,
-            "d_loss": d_loss,
-            "g_loss": g_loss,
-            "d_loss_real": d_loss_real,
-            "d_loss_fake": d_loss_fake
-        })
-        return metrics
-
-    def test_step(self, data):
-        if isinstance(data, tuple):
-            real_images = data[0]
-        else:
-            real_images = data
-        z_mean, z_log_var, z = self.encoder(real_images, training=False)
-        fake_images = self.decoder(z, training=False)
-        recon_loss = tf.reduce_mean(keras.losses.mean_squared_error(real_images, fake_images))
-        kl_loss = -0.5 * tf.reduce_mean(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-        vae_loss = recon_loss + beta * kl_loss
-        target_score = 0.9
-        fake_preds = self.discriminator(fake_images, training=False)
-        misleading_labels = tf.ones_like(fake_preds) * target_score
-        g_loss = tf.reduce_mean(keras.losses.mean_squared_error(misleading_labels, fake_preds))
-        total_loss = vae_loss + 0.5 * g_loss
-        return {
-            "loss": total_loss,
-            "recon_loss": recon_loss,
-            "kl_loss": kl_loss,
-            "g_loss": g_loss
-        }
-
-
-vae_gan = VAEGAN(encoder, decoder, discriminator)
-
-
-class LossHistoryCallback(tf.keras.callbacks.Callback):
-    def __init__(self):
-        super().__init__()
-        self.losses = []
-        self.val_losses = []
-        self.recon_losses = []
-        self.kl_losses = []
-        self.d_losses = []
-        self.g_losses = []
-        self.val_recon_losses = []
-        self.val_kl_losses = []
-        self.val_g_losses = []
-
-    def on_epoch_end(self, epoch, logs=None):
-        self.losses.append(logs.get('loss'))
-        self.val_losses.append(logs.get('val_loss'))
-        self.recon_losses.append(logs.get('recon_loss'))
-        self.kl_losses.append(logs.get('kl_loss'))
-        self.d_losses.append(logs.get('d_loss'))
-        self.g_losses.append(logs.get('g_loss'))
-        self.val_recon_losses.append(logs.get('val_recon_loss'))
-        self.val_kl_losses.append(logs.get('val_kl_loss'))
-        self.val_g_losses.append(logs.get('val_g_loss'))
-
-
-loss_history_callback = LossHistoryCallback()
-
-
+# ----------------------------------------------------------------------------
+# 4.6 Plotting utilities
+# ----------------------------------------------------------------------------
 def save_figure_multiple_formats(filename_base, dpi=None, bbox_inches='tight', **kwargs):
     if dpi is None:
         dpi = HIGH_RES_CONFIG['dpi']
@@ -755,6 +776,47 @@ def plot_histograms_and_densities(original, reconstructed, latent, epoch=None):
 def analyze_latent_space(encoder, data, num_samples=1000):
     _, _, z = encoder.predict(data[:num_samples], verbose=0)
     return z.flatten()
+
+
+# ============================================================================
+# 5. TRAINING
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 5.1 Callbacks
+# ----------------------------------------------------------------------------
+class ClearMemoryCallback(Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        gc.collect()
+        K.clear_session()
+
+
+class LossHistoryCallback(tf.keras.callbacks.Callback):
+    def __init__(self):
+        super().__init__()
+        self.losses = []
+        self.val_losses = []
+        self.recon_losses = []
+        self.kl_losses = []
+        self.d_losses = []
+        self.g_losses = []
+        self.val_recon_losses = []
+        self.val_kl_losses = []
+        self.val_g_losses = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.losses.append(logs.get('loss'))
+        self.val_losses.append(logs.get('val_loss'))
+        self.recon_losses.append(logs.get('recon_loss'))
+        self.kl_losses.append(logs.get('kl_loss'))
+        self.d_losses.append(logs.get('d_loss'))
+        self.g_losses.append(logs.get('g_loss'))
+        self.val_recon_losses.append(logs.get('val_recon_loss'))
+        self.val_kl_losses.append(logs.get('val_kl_loss'))
+        self.val_g_losses.append(logs.get('val_g_loss'))
+
+
+loss_history_callback = LossHistoryCallback()
 
 
 class DistributionPlotCallback(tf.keras.callbacks.Callback):
@@ -1068,10 +1130,9 @@ class EnhancedMetricCallback(tf.keras.callbacks.Callback):
             np.save(f'training_outputs/{key}.npy', values)
 
 
-# ==============================================
-# TRAINING
-# ==============================================
-
+# ----------------------------------------------------------------------------
+# 5.2 Training setup and execution
+# ----------------------------------------------------------------------------
 def scheduler(epoch, lr):
     if epoch < 50:
         return lr
@@ -1129,21 +1190,13 @@ end_time = time.time()
 execution_time = end_time - start_time
 
 
-def save_execution_time(filename, execution_time):
-    with open(filename, 'w') as f:
-        f.write(f"=== Execution Time ===\n")
-        f.write(f"Total: {execution_time:.2f} seconds\n")
-        f.write(f"Total: {execution_time / 60:.2f} minutes\n")
-        f.write(f"Total: {execution_time / 3600:.2f} hours\n")
-        f.write(f"\nSettings:\n- Batch size: {batch_size}\n- Epochs: {epochs}\n"
-                f"- Latent dim: {latent_dim}\n- Learning rate: {lr}\n"
-                f"- Beta (KL weight): {beta}\n"
-                f"- Model: VAE-GAN with 10% reduced architecture\n"
-                f"- LR Scheduler: Exponential decay after epoch 50\n"
-                f"- FID: Stable (PCA-reduced when rank-deficient + eps regularization)\n"
-                f"- FID/FRD sampling: {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples ({FID_SAMPLE_SIZE} total)\n")
+# ============================================================================
+# 6. EVALUATION & PLOTS
+# ============================================================================
 
-
+# ----------------------------------------------------------------------------
+# 6.1 Loss plots
+# ----------------------------------------------------------------------------
 def plot_total_loss(losses, val_losses):
     figsize = (12 * HIGH_RES_CONFIG['figsize_multiplier'],
                7 * HIGH_RES_CONFIG['figsize_multiplier'])
@@ -1165,37 +1218,6 @@ def plot_total_loss(losses, val_losses):
     save_figure_multiple_formats("training_outputs/total_loss", dpi=HIGH_RES_CONFIG['dpi'],
                                  bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.show()
-
-
-def save_metrics_to_file(filename, history, loss_history_callback):
-    loss = history.history.get('loss', [])
-    val_loss = history.history.get('val_loss', [])
-    recon_loss = history.history.get('recon_loss', [0] * len(loss) if loss else [])
-    val_recon_loss = history.history.get('val_recon_loss', [0] * len(loss) if loss else [])
-    kl_loss = history.history.get('kl_loss', [0] * len(loss) if loss else [])
-    val_kl_loss = history.history.get('val_kl_loss', [0] * len(loss) if loss else [])
-    d_loss = history.history.get('d_loss', [0] * len(loss) if loss else [])
-    g_loss = history.history.get('g_loss', [0] * len(loss) if loss else [])
-    if not loss and hasattr(loss_history_callback, 'recon_losses'):
-        print("Warning: Using data from loss_history_callback instead of history")
-        loss = loss_history_callback.losses
-        val_loss = loss_history_callback.val_losses
-        recon_loss = loss_history_callback.recon_losses
-        kl_loss = loss_history_callback.kl_losses
-        d_loss = loss_history_callback.d_losses
-        g_loss = loss_history_callback.g_losses
-        val_recon_loss = loss_history_callback.val_recon_losses
-        val_kl_loss = loss_history_callback.val_kl_losses
-        if not loss: loss = [r + k + g for r, k, g in zip(recon_loss, kl_loss, g_loss)]
-        if not val_loss: val_loss = [r + k for r, k in zip(val_recon_loss, val_kl_loss)]
-    with open(filename, 'w') as f:
-        f.write("Epoch\tLoss\tVal_Loss\tRecon_Loss\tVal_Recon_Loss\tKL_Loss\tVal_KL_Loss\tD_Loss\tG_Loss\n")
-        for i in range(len(loss)):
-            f.write(f"{i + 1}\t{loss[i]:.6f}\t{val_loss[i]:.6f}\t"
-                    f"{recon_loss[i]:.6f}\t{val_recon_loss[i]:.6f}\t"
-                    f"{kl_loss[i]:.6f}\t{val_kl_loss[i]:.6f}\t"
-                    f"{d_loss[i]:.6f}\t{g_loss[i]:.6f}\n")
-    plot_total_loss(loss, val_loss)
 
 
 def plot_losses(recon_losses, kl_losses, d_losses, g_losses, val_recon_losses, val_kl_losses, val_g_losses):
@@ -1282,45 +1304,9 @@ def plot_losses(recon_losses, kl_losses, d_losses, g_losses, val_recon_losses, v
     plt.show()
 
 
-def save_losses_to_file(filename, recon_losses, kl_losses, d_losses, g_losses,
-                        val_recon_losses, val_kl_losses, val_g_losses):
-    with open(filename, 'w') as f:
-        f.write("Epoch\tTrain_Recon_Loss\tTrain_KL_Loss\tD_Loss\tG_Loss\tVal_Recon_Loss\tVal_KL_Loss\tVal_G_Loss\n")
-        for epoch, (recon_loss, kl_loss, d_loss, g_loss, val_recon, val_kl, val_g) in enumerate(
-                zip(recon_losses, kl_losses, d_losses, g_losses, val_recon_losses, val_kl_losses, val_g_losses)):
-            f.write(f"{epoch + 1}\t{recon_loss:.6f}\t{kl_loss:.6f}\t{d_loss:.6f}\t{g_loss:.6f}\t"
-                    f"{val_recon:.6f}\t{val_kl:.6f}\t{val_g:.6f}\n")
-
-
-os.makedirs('training_outputs', exist_ok=True)
-save_execution_time("training_outputs/execution_time.txt", execution_time)
-print(f"\n[INFO] Total execution time: {execution_time / 3600:.2f} hours")
-
-plot_losses(loss_history_callback.recon_losses, loss_history_callback.kl_losses,
-            loss_history_callback.d_losses, loss_history_callback.g_losses,
-            loss_history_callback.val_recon_losses, loss_history_callback.val_kl_losses,
-            loss_history_callback.val_g_losses)
-
-save_losses_to_file("training_outputs/loss_history.txt",
-                    loss_history_callback.recon_losses, loss_history_callback.kl_losses,
-                    loss_history_callback.d_losses, loss_history_callback.g_losses,
-                    loss_history_callback.val_recon_losses, loss_history_callback.val_kl_losses,
-                    loss_history_callback.val_g_losses)
-
-save_metrics_to_file("training_outputs/training_metrics.txt", history, loss_history_callback)
-
-encoder.save_weights('training_outputs/encoder_weights.h5')
-decoder.save_weights('training_outputs/decoder_weights.h5')
-discriminator.save_weights('training_outputs/discriminator_weights.h5')
-
-encoder.save('training_outputs/encoder_model.h5')
-decoder.save('training_outputs/decoder_model.h5')
-discriminator.save('training_outputs/discriminator_model.h5')
-
-# ==============================================
-# FINAL ANALYSIS
-# ==============================================
-
+# ----------------------------------------------------------------------------
+# 6.2 Final analysis plots
+# ----------------------------------------------------------------------------
 test_samples = x_test[:5]
 _, _, z = vae_gan.encoder.predict(test_samples, verbose=0)
 reconstructions = vae_gan.decoder.predict(z, verbose=0)
@@ -1328,6 +1314,7 @@ latent_samples = analyze_latent_space(vae_gan.encoder, x_test, num_samples=1000)
 
 plot_histograms_and_densities(test_samples, reconstructions, latent_samples)
 
+# Latent space 2D projection
 figsize = (14 * HIGH_RES_CONFIG['figsize_multiplier'],
            7 * HIGH_RES_CONFIG['figsize_multiplier'])
 plt.figure(figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
@@ -1615,6 +1602,14 @@ def generate_final_report(filepath, params, execution_time, loss_history, metric
     print(f"\n✓ Final report saved to: {filepath}")
 
 
+# ----------------------------------------------------------------------------
+# 6.3 Execute loss plots + final report
+# ----------------------------------------------------------------------------
+plot_losses(loss_history_callback.recon_losses, loss_history_callback.kl_losses,
+            loss_history_callback.d_losses, loss_history_callback.g_losses,
+            loss_history_callback.val_recon_losses, loss_history_callback.val_kl_losses,
+            loss_history_callback.val_g_losses)
+
 training_params = {
     'Dataset': name,
     'Latent dimension (zdim)': zdim,
@@ -1641,6 +1636,99 @@ generate_final_report(filepath=report_path, params=training_params,
                       metrics_history=enhanced_metric_callback,
                       static_metrics_results=static_metrics_results)
 
+
+# ============================================================================
+# 7. SAVING
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 7.1 Execution time and loss history files
+# ----------------------------------------------------------------------------
+def save_execution_time(filename, execution_time):
+    with open(filename, 'w') as f:
+        f.write(f"=== Execution Time ===\n")
+        f.write(f"Total: {execution_time:.2f} seconds\n")
+        f.write(f"Total: {execution_time / 60:.2f} minutes\n")
+        f.write(f"Total: {execution_time / 3600:.2f} hours\n")
+        f.write(f"\nSettings:\n- Batch size: {batch_size}\n- Epochs: {epochs}\n"
+                f"- Latent dim: {latent_dim}\n- Learning rate: {lr}\n"
+                f"- Beta (KL weight): {beta}\n"
+                f"- Model: VAE-GAN with 10% reduced architecture\n"
+                f"- LR Scheduler: Exponential decay after epoch 50\n"
+                f"- FID: Stable (PCA-reduced when rank-deficient + eps regularization)\n"
+                f"- FID/FRD sampling: {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples ({FID_SAMPLE_SIZE} total)\n")
+
+
+def save_metrics_to_file(filename, history, loss_history_callback):
+    loss = history.history.get('loss', [])
+    val_loss = history.history.get('val_loss', [])
+    recon_loss = history.history.get('recon_loss', [0] * len(loss) if loss else [])
+    val_recon_loss = history.history.get('val_recon_loss', [0] * len(loss) if loss else [])
+    kl_loss = history.history.get('kl_loss', [0] * len(loss) if loss else [])
+    val_kl_loss = history.history.get('val_kl_loss', [0] * len(loss) if loss else [])
+    d_loss = history.history.get('d_loss', [0] * len(loss) if loss else [])
+    g_loss = history.history.get('g_loss', [0] * len(loss) if loss else [])
+    if not loss and hasattr(loss_history_callback, 'recon_losses'):
+        print("Warning: Using data from loss_history_callback instead of history")
+        loss = loss_history_callback.losses
+        val_loss = loss_history_callback.val_losses
+        recon_loss = loss_history_callback.recon_losses
+        kl_loss = loss_history_callback.kl_losses
+        d_loss = loss_history_callback.d_losses
+        g_loss = loss_history_callback.g_losses
+        val_recon_loss = loss_history_callback.val_recon_losses
+        val_kl_loss = loss_history_callback.val_kl_losses
+        if not loss: loss = [r + k + g for r, k, g in zip(recon_loss, kl_loss, g_loss)]
+        if not val_loss: val_loss = [r + k for r, k in zip(val_recon_loss, val_kl_loss)]
+    with open(filename, 'w') as f:
+        f.write("Epoch\tLoss\tVal_Loss\tRecon_Loss\tVal_Recon_Loss\tKL_Loss\tVal_KL_Loss\tD_Loss\tG_Loss\n")
+        for i in range(len(loss)):
+            f.write(f"{i + 1}\t{loss[i]:.6f}\t{val_loss[i]:.6f}\t"
+                    f"{recon_loss[i]:.6f}\t{val_recon_loss[i]:.6f}\t"
+                    f"{kl_loss[i]:.6f}\t{val_kl_loss[i]:.6f}\t"
+                    f"{d_loss[i]:.6f}\t{g_loss[i]:.6f}\n")
+    plot_total_loss(loss, val_loss)
+
+
+def save_losses_to_file(filename, recon_losses, kl_losses, d_losses, g_losses,
+                        val_recon_losses, val_kl_losses, val_g_losses):
+    with open(filename, 'w') as f:
+        f.write("Epoch\tTrain_Recon_Loss\tTrain_KL_Loss\tD_Loss\tG_Loss\tVal_Recon_Loss\tVal_KL_Loss\tVal_G_Loss\n")
+        for epoch, (recon_loss, kl_loss, d_loss, g_loss, val_recon, val_kl, val_g) in enumerate(
+                zip(recon_losses, kl_losses, d_losses, g_losses, val_recon_losses, val_kl_losses, val_g_losses)):
+            f.write(f"{epoch + 1}\t{recon_loss:.6f}\t{kl_loss:.6f}\t{d_loss:.6f}\t{g_loss:.6f}\t"
+                    f"{val_recon:.6f}\t{val_kl:.6f}\t{val_g:.6f}\n")
+
+
+# ----------------------------------------------------------------------------
+# 7.2 Execute saves
+# ----------------------------------------------------------------------------
+os.makedirs('training_outputs', exist_ok=True)
+save_execution_time("training_outputs/execution_time.txt", execution_time)
+print(f"\n[INFO] Total execution time: {execution_time / 3600:.2f} hours")
+
+save_losses_to_file("training_outputs/loss_history.txt",
+                    loss_history_callback.recon_losses, loss_history_callback.kl_losses,
+                    loss_history_callback.d_losses, loss_history_callback.g_losses,
+                    loss_history_callback.val_recon_losses, loss_history_callback.val_kl_losses,
+                    loss_history_callback.val_g_losses)
+
+save_metrics_to_file("training_outputs/training_metrics.txt", history, loss_history_callback)
+
+# ----------------------------------------------------------------------------
+# 7.3 Save models
+# ----------------------------------------------------------------------------
+encoder.save_weights('training_outputs/encoder_weights.h5')
+decoder.save_weights('training_outputs/decoder_weights.h5')
+discriminator.save_weights('training_outputs/discriminator_weights.h5')
+
+encoder.save('training_outputs/encoder_model.h5')
+decoder.save('training_outputs/decoder_model.h5')
+discriminator.save('training_outputs/discriminator_model.h5')
+
+# ----------------------------------------------------------------------------
+# 7.4 Final summary
+# ----------------------------------------------------------------------------
 print("\n" + "=" * 60)
 print("VAE-GAN TRAINING COMPLETED SUCCESSFULLY")
 print("=" * 60)
