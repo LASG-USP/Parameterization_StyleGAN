@@ -1,67 +1,56 @@
-import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-import matplotlib.pyplot as plt
+# ============================================================================
+# STYLEGAN2 WITH W-SPACE SUPPORT FOR GEOSTATISTICAL FACIES MODELING
+# ============================================================================
+# Standard deep learning pipeline structure:
+#   1. IMPORTS & CONFIGURATION
+#   2. DATA LOADING & PREPROCESSING
+#   3. MODEL ARCHITECTURE
+#   4. METRICS & UTILITIES
+#   5. TRAINING
+#   6. EVALUATION & PLOTS
+#   7. SAVING
+# ============================================================================
+
+
+# ============================================================================
+# 1. IMPORTS & CONFIGURATION
+# ============================================================================
+
 import os
-import seaborn as sns
-import pandas as pd
-from sklearn.decomposition import PCA
-from sklearn.manifold import MDS
-from scipy.spatial.distance import pdist, squareform, cdist
 import gc
-from functools import lru_cache
-import psutil
-from scipy.stats import entropy, norm, kstest
-from sklearn.metrics import pairwise_kernels
-from scipy import linalg
-from scipy.stats import gaussian_kde
-import pickle
 import time
-from PIL import Image
-import gc
-from tensorflow.keras import backend as K
-from tensorflow.keras.callbacks import Callback
+import pickle
+import json
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import pandas as pd
+import psutil
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, backend as K
+from tensorflow.keras.callbacks import Callback
+from keras.applications.inception_v3 import InceptionV3
+from PIL import Image
+
+from sklearn.decomposition import PCA
+from sklearn.manifold import MDS
+from sklearn.metrics import pairwise_kernels
+from scipy.spatial.distance import pdist, squareform, cdist
+from scipy.stats import entropy, norm, kstest
+from scipy.stats import gaussian_kde
+from scipy import linalg
+
 from metrics import *
 
 
-
-
-class ClearMemoryCallback(Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        gc.collect()
-        K.clear_session()
-
-
-plt.rcParams.update({
-    'font.size': 20,
-    'axes.titlesize': 24,
-    'axes.labelsize': 22,
-    'xtick.labelsize': 18,
-    'ytick.labelsize': 18,
-    'legend.fontsize': 18,
-    'figure.titlesize': 26,
-    'figure.dpi': 100,
-    'savefig.dpi': 300,
-    'font.family': 'sans-serif',
-})
-
-
-tf.keras.backend.clear_session()
-gc.collect()
-
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"Available GPUs: {len(gpus)}")
-    except RuntimeError as e:
-        print(e)
-
-# Configuration parameters
+# ----------------------------------------------------------------------------
+# Global configuration
+# ----------------------------------------------------------------------------
 zdim = 512
 epochs = 150
 metric_interval = 10
@@ -81,6 +70,41 @@ HIGH_RES_CONFIG = {
     'hist_bins': 150,
     'save_formats': ['png', 'svg']
 }
+
+# ----------------------------------------------------------------------------
+# Environment setup
+# ----------------------------------------------------------------------------
+plt.rcParams.update({
+    'font.size': 20,
+    'axes.titlesize': 24,
+    'axes.labelsize': 22,
+    'xtick.labelsize': 18,
+    'ytick.labelsize': 18,
+    'legend.fontsize': 18,
+    'figure.titlesize': 26,
+    'figure.dpi': 100,
+    'savefig.dpi': 300,
+    'font.family': 'sans-serif',
+})
+
+tf.keras.backend.clear_session()
+gc.collect()
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"Available GPUs: {len(gpus)}")
+    except RuntimeError as e:
+        print(e)
+
+os.makedirs('training_outputs', exist_ok=True)
+
+
+# ============================================================================
+# 2. DATA LOADING & PREPROCESSING
+# ============================================================================
 
 # Load dataset
 if name == '3facies_2d_80k':
@@ -108,620 +132,13 @@ latent_dim = zdim
 w_dim = zdim * 2  # Dimension of the W space (after mapping network)
 
 
-class MemoryOptimizer:
-    @staticmethod
-    def memory_usage():
-        process = psutil.Process()
-        return process.memory_info().rss / 1024 ** 2
-
-    @staticmethod
-    def clear_memory():
-        tf.keras.backend.clear_session()
-        gc.collect()
-
-    @staticmethod
-    def batch_generator(data, batch_size):
-        n_samples = len(data)
-        for i in range(0, n_samples, batch_size):
-            yield data[i:i + batch_size]
-
-    @staticmethod
-    def check_memory(threshold_mb=8000):
-        current_memory = MemoryOptimizer.memory_usage()
-        if current_memory > threshold_mb:
-            MemoryOptimizer.clear_memory()
-            print(f"Memory cleared. Current usage: {current_memory:.2f} MB")
-            return True
-        return False
-
-
-class StaticMetrics:
-    @staticmethod
-    def variogram_2d(data, lag_distances=None, max_lag=None):
-        if len(data.shape) == 4:
-            data = data[..., 0]
-
-        n_samples, height, width = data.shape[:3]
-
-        if lag_distances is None:
-            if max_lag is None:
-                max_lag = min(height, width) // 2
-            lag_distances = np.arange(1, max_lag + 1)
-
-        variogram = np.zeros(len(lag_distances))
-        counts = np.zeros(len(lag_distances))
-
-        for i in range(height):
-            for j in range(width):
-                for k, lag in enumerate(lag_distances):
-                    if j + lag < width:
-                        for sample in range(n_samples):
-                            diff = data[sample, i, j] - data[sample, i, j + lag]
-                            variogram[k] += diff ** 2
-                            counts[k] += 1
-
-                    if i + lag < height:
-                        for sample in range(n_samples):
-                            diff = data[sample, i, j] - data[sample, i + lag, j]
-                            variogram[k] += diff ** 2
-                            counts[k] += 1
-
-        variogram = variogram / (2 * counts)
-        variogram[counts == 0] = 0
-
-        return lag_distances, variogram
-
-    @staticmethod
-    def connectivity_function(data, threshold, lag_distances=None):
-        if len(data.shape) == 4:
-            data = data[..., 0]
-
-        n_samples, height, width = data.shape[:3]
-        binary_data = (data > threshold).astype(float)
-
-        if lag_distances is None:
-            max_lag = min(height, width) // 2
-            lag_distances = np.arange(1, max_lag + 1)
-
-        connectivity = np.zeros(len(lag_distances))
-
-        for k, lag in enumerate(lag_distances):
-            connected_pairs = 0
-            total_pairs = 0
-
-            for sample in range(n_samples):
-                for i in range(height):
-                    for j in range(width):
-                        if binary_data[sample, i, j] == 1:
-                            if j + lag < width and binary_data[sample, i, j + lag] == 1:
-                                connected_pairs += 1
-                            total_pairs += 1
-
-                            if i + lag < height and binary_data[sample, i + lag, j] == 1:
-                                connected_pairs += 1
-                            total_pairs += 1
-
-            if total_pairs > 0:
-                connectivity[k] = connected_pairs / total_pairs
-
-        return lag_distances, connectivity
-
-    @staticmethod
-    def calculate_histogram_kl(real_data, fake_data, bins=100, epsilon=1e-10):
-        if len(real_data.shape) == 4:
-            real_flat = real_data[..., 0].flatten()
-            fake_flat = fake_data[..., 0].flatten()
-        else:
-            real_flat = real_data.flatten()
-            fake_flat = fake_data.flatten()
-
-        min_val = min(real_flat.min(), fake_flat.min())
-        max_val = max(real_flat.max(), fake_flat.max())
-
-        hist_real, bin_edges = np.histogram(real_flat, bins=bins, range=(min_val, max_val), density=True)
-        hist_fake, _ = np.histogram(fake_flat, bins=bin_edges, density=True)
-
-        hist_real = hist_real + epsilon
-        hist_fake = hist_fake + epsilon
-
-        hist_real = hist_real / hist_real.sum()
-        hist_fake = hist_fake / hist_fake.sum()
-
-        kl_div = entropy(hist_real, hist_fake)
-
-        return kl_div, hist_real, hist_fake, bin_edges
-
-    @staticmethod
-    def calculate_pca_correlation(real_data, fake_data, n_components=50):
-        n_real = real_data.shape[0]
-        n_fake = fake_data.shape[0]
-
-        real_flat = real_data.reshape(n_real, -1)
-        fake_flat = fake_data.reshape(n_fake, -1)
-
-        combined_data = np.vstack([real_flat, fake_flat])
-
-        n_components = min(n_components, combined_data.shape[1], combined_data.shape[0])
-        pca = PCA(n_components=n_components)
-        pca.fit(combined_data)
-
-        real_pca = pca.transform(real_flat)
-        fake_pca = pca.transform(fake_flat)
-
-        correlations = []
-        for i in range(min(n_components, real_pca.shape[1], fake_pca.shape[1])):
-            if np.std(real_pca[:, i]) > 0 and np.std(fake_pca[:, i]) > 0:
-                corr = np.corrcoef(real_pca[:, i], fake_pca[:, i])[0, 1]
-                correlations.append(corr)
-
-        avg_correlation = np.mean(np.abs(correlations)) if correlations else 0
-
-        return avg_correlation, real_pca, fake_pca, pca.explained_variance_ratio_
-
-    @staticmethod
-    def calculate_mds_mmd(real_data, fake_data, subsample=500, kernel='rbf', gamma=None):
-        n_real = min(subsample, real_data.shape[0])
-        n_fake = min(subsample, fake_data.shape[0])
-
-        real_subsample = real_data[:n_real]
-        fake_subsample = fake_data[:n_fake]
-
-        real_flat = real_subsample.reshape(n_real, -1)
-        fake_flat = fake_subsample.reshape(n_fake, -1)
-
-        if n_real + n_fake > 100:
-            pca = PCA(n_components=min(50, real_flat.shape[1]))
-            combined = np.vstack([real_flat, fake_flat])
-            combined_pca = pca.fit_transform(combined)
-            real_mds = combined_pca[:n_real]
-            fake_mds = combined_pca[n_real:]
-        else:
-            mds = MDS(n_components=2, random_state=42, n_jobs=-1)
-            combined = np.vstack([real_flat, fake_flat])
-            combined_mds = mds.fit_transform(combined)
-            real_mds = combined_mds[:n_real]
-            fake_mds = combined_mds[n_real:]
-
-        def rbf_kernel(X, Y, gamma=None):
-            if gamma is None:
-                gamma = 1.0 / X.shape[1]
-
-            XX = np.sum(X ** 2, axis=1)[:, np.newaxis]
-            YY = np.sum(Y ** 2, axis=1)[:, np.newaxis]
-            XY = np.dot(X, Y.T)
-
-            distances = XX + YY.T - 2 * XY
-            return np.exp(-gamma * distances)
-
-        K_XX = rbf_kernel(real_mds, real_mds, gamma)
-        K_YY = rbf_kernel(fake_mds, fake_mds, gamma)
-        K_XY = rbf_kernel(real_mds, fake_mds, gamma)
-
-        mmd_squared = (K_XX.mean() + K_YY.mean() - 2 * K_XY.mean())
-        mmd = np.sqrt(max(mmd_squared, 0))
-
-        return mmd, real_mds, fake_mds
-
-    @staticmethod
-    def compute_all_metrics(real_data, fake_data, threshold=0.5, max_lag=25):
-        metrics = {}
-
-        print("Calculating all metrics...")
-
-        lags, variogram_real = StaticMetrics.variogram_2d(real_data[:100], max_lag=max_lag)
-        _, variogram_fake = StaticMetrics.variogram_2d(fake_data[:100], max_lag=max_lag)
-
-        metrics['variogram_lags'] = lags
-        metrics['variogram_real'] = variogram_real
-        metrics['variogram_fake'] = variogram_fake
-        metrics['variogram_mse'] = np.mean((variogram_real - variogram_fake) ** 2)
-
-        _, connectivity_real = StaticMetrics.connectivity_function(
-            real_data[:100], threshold, lag_distances=lags
-        )
-        _, connectivity_fake = StaticMetrics.connectivity_function(
-            fake_data[:100], threshold, lag_distances=lags
-        )
-
-        metrics['connectivity_real'] = connectivity_real
-        metrics['connectivity_fake'] = connectivity_fake
-        metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
-
-        kl_div, hist_real, hist_fake, bin_edges = StaticMetrics.calculate_histogram_kl(
-            real_data, fake_data, bins=100
-        )
-        metrics['hist_kl'] = kl_div
-        metrics['hist_real'] = hist_real
-        metrics['hist_fake'] = hist_fake
-        metrics['hist_bin_edges'] = bin_edges
-
-        pca_corr, real_pca, fake_pca, var_ratio = StaticMetrics.calculate_pca_correlation(
-            real_data, fake_data, n_components=50
-        )
-        metrics['pca_correlation'] = pca_corr
-        metrics['pca_real'] = real_pca[:, :2] if real_pca.shape[1] >= 2 else real_pca
-        metrics['pca_fake'] = fake_pca[:, :2] if fake_pca.shape[1] >= 2 else fake_pca
-        metrics['pca_var_ratio'] = var_ratio
-
-        mmd, real_mds, fake_mds = StaticMetrics.calculate_mds_mmd(
-            real_data, fake_data, subsample=500
-        )
-        metrics['mds_mmd'] = mmd
-        metrics['mds_real'] = real_mds
-        metrics['mds_fake'] = fake_mds
-
-        return metrics
-
-
-class TraditionalMetrics:
-    _inception_model = None
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_inception(cls, shape):
-        from keras.applications.inception_v3 import InceptionV3
-        if cls._inception_model is None:
-            cls._inception_model = InceptionV3(
-                include_top=False,
-                pooling='avg',
-                input_shape=(shape[0], shape[1], 3)
-            )
-        return cls._inception_model
-
-    @staticmethod
-    def get_classifier(filepath):
-        RC_full = tf.keras.models.load_model(filepath)
-        f_extraction = tf.keras.Model(
-            inputs=RC_full.input,
-            outputs=layers.GlobalAveragePooling2D()(RC_full.layers[-5].output)
-        )
-        return f_extraction
-
-    @staticmethod
-    def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
-        # ------------------------------------------------------------------
-        # FID FIX:
-        # Adds an epsilon regularizer to the diagonal of the covariance
-        # matrices before computing the matrix square root. This is the
-        # standard practice (official TensorFlow FID / original FID paper) and
-        # prevents sqrtm from producing huge NaN/Inf/complex values when
-        # the covariance matrices are ill-conditioned.
-        # ------------------------------------------------------------------
-        mu1 = np.atleast_1d(mu1).astype(np.float64)
-        mu2 = np.atleast_1d(mu2).astype(np.float64)
-        sigma1 = np.atleast_2d(sigma1).astype(np.float64)
-        sigma2 = np.atleast_2d(sigma2).astype(np.float64)
-
-        diff = mu1 - mu2
-
-        # Numerical regularization: ensures dominant diagonal
-        sigma1 = sigma1 + np.eye(sigma1.shape[0]) * eps
-        sigma2 = sigma2 + np.eye(sigma2.shape[0]) * eps
-
-        # Computes sqrtm of the product with non-finite handling
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-
-        if not np.isfinite(covmean).all():
-            offset = np.eye(sigma1.shape[0]) * eps
-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
-
-        if np.iscomplexobj(covmean):
-            if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
-                m = np.max(np.abs(covmean.imag))
-                raise ValueError(f"Imaginary component {m}")
-            covmean = covmean.real
-
-        tr_covmean = np.trace(covmean)
-
-        fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2.0 * tr_covmean
-        return float(fid)
-
-    @staticmethod
-    def frechet_distance(real_features, fake_features):
-        mu1, sigma1 = np.mean(real_features, axis=0), np.cov(real_features, rowvar=False)
-        mu2, sigma2 = np.mean(fake_features, axis=0), np.cov(fake_features, rowvar=False)
-
-        fid_value = TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-        return fid_value
-
-    @staticmethod
-    def frechet_distance_batched(real_features, fake_features, n_batches=10, batch_size=1000):
-        """
-        Computes the Frechet Distance using batched computation over 10 batches of 1000 samples.
-        Accumulates the statistics (mean and covariance) incrementally between batches.
-        """
-        real_features = np.asarray(real_features, dtype=np.float64)
-        fake_features = np.asarray(fake_features, dtype=np.float64)
-
-        # Accumulate statistics for the real features
-        real_sum = np.zeros(real_features.shape[1], dtype=np.float64)
-        real_sum_sq = np.zeros((real_features.shape[1], real_features.shape[1]), dtype=np.float64)
-        real_count = 0
-
-        for i in range(n_batches):
-            start = i * batch_size
-            end = start + batch_size
-            batch = real_features[start:end]
-            real_sum += batch.sum(axis=0)
-            real_sum_sq += batch.T @ batch
-            real_count += batch.shape[0]
-
-        mu1 = real_sum / real_count
-        sigma1 = (real_sum_sq / real_count) - np.outer(mu1, mu1)
-
-        # Accumulate statistics for the generated features
-        fake_sum = np.zeros(fake_features.shape[1], dtype=np.float64)
-        fake_sum_sq = np.zeros((fake_features.shape[1], fake_features.shape[1]), dtype=np.float64)
-        fake_count = 0
-
-        for i in range(n_batches):
-            start = i * batch_size
-            end = start + batch_size
-            batch = fake_features[start:end]
-            fake_sum += batch.sum(axis=0)
-            fake_sum_sq += batch.T @ batch
-            fake_count += batch.shape[0]
-
-        mu2 = fake_sum / fake_count
-        sigma2 = (fake_sum_sq / fake_count) - np.outer(mu2, mu2)
-
-        if sigma1.ndim == 0: sigma1 = np.array([[sigma1]])
-        if sigma2.ndim == 0: sigma2 = np.array([[sigma2]])
-
-        return TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-
-    @staticmethod
-    def kernel_distance(real_features, fake_features, num_blocks=100, max_block_size=1000):
-        n_samples = min(len(real_features), len(fake_features))
-        block_size = min(max_block_size, n_samples // num_blocks)
-
-        kid_scores = []
-        for _ in range(num_blocks):
-            idx_real = np.random.choice(len(real_features), block_size, replace=False)
-            idx_fake = np.random.choice(len(fake_features), block_size, replace=False)
-
-            real_block = real_features[idx_real]
-            fake_block = fake_features[idx_fake]
-
-            gamma = 1.0 / real_block.shape[1]
-            K_XX = pairwise_kernels(real_block, real_block, metric='rbf', gamma=gamma)
-            K_YY = pairwise_kernels(fake_block, fake_block, metric='rbf', gamma=gamma)
-            K_XY = pairwise_kernels(real_block, fake_block, metric='rbf', gamma=gamma)
-
-            kid = (K_XX.mean() + K_YY.mean() - 2 * K_XY.mean())
-            kid_scores.append(kid)
-
-        return np.mean(kid_scores)
-
-    @staticmethod
-    def compute_all_traditional_metrics(real_data, fake_data, classifier_path='Reservoir_classifier.h5'):
-        """Computes all traditional metrics.
-
-        FID and FRD are computed with 10000 samples split into 10 batches of 1000,
-        accumulating the statistics (mean and covariance) incrementally.
-        """
-        print("Calculating traditional metrics...")
-
-        # Ensure exactly 10000 samples for batched FID/FRD (10 batches x 1000)
-        FID_N_BATCHES = 10
-        FID_BATCH_SIZE = 1000
-        FID_TOTAL = FID_N_BATCHES * FID_BATCH_SIZE  # 10000
-
-        n_available = min(len(real_data), len(fake_data))
-        n_fid = min(FID_TOTAL, n_available)
-
-        # If fewer than 10000 samples available, adjust batch size
-        if n_fid < FID_TOTAL:
-            FID_N_BATCHES = max(1, n_fid // FID_BATCH_SIZE)
-            if FID_N_BATCHES == 0:
-                FID_N_BATCHES = 1
-                FID_BATCH_SIZE = n_fid
-            else:
-                FID_BATCH_SIZE = n_fid // FID_N_BATCHES
-
-        real_fid_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
-        fake_fid_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
-
-        # Prepare inputs for InceptionV3 (75x75x3)
-        real_resized = tf.image.resize(np.repeat(real_fid_data, 3, axis=3), [75, 75])
-        fake_resized = tf.image.resize(np.repeat(fake_fid_data, 3, axis=3), [75, 75])
-
-        inception_model = TraditionalMetrics.get_inception((75, 75, 3))
-        act_real_iv3 = inception_model.predict(real_resized, batch_size=32, verbose=0)
-        act_fake_iv3 = inception_model.predict(fake_resized, batch_size=32, verbose=0)
-
-        # FID: 10 batches of 1000 (accumulated statistics)
-        fid_10k = TraditionalMetrics.frechet_distance_batched(
-            act_real_iv3, act_fake_iv3,
-            n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
-        )
-
-        # KID remains unchanged (full set / existing behavior)
-        n_samples = min(10000, len(real_data), len(fake_data))
-        kid_10k = TraditionalMetrics.kernel_distance(act_real_iv3[:n_samples], act_fake_iv3[:n_samples])
-
-        n_500 = min(500, len(real_data), len(fake_data))
-        fid_500 = TraditionalMetrics.frechet_distance(act_real_iv3[:n_500], act_fake_iv3[:n_500])
-        kid_500 = TraditionalMetrics.kernel_distance(act_real_iv3[:n_500], act_fake_iv3[:n_500])
-
-        try:
-            classifier_model = TraditionalMetrics.get_classifier(classifier_path)
-
-            # Prepare inputs for the RC classifier
-            real_rc_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
-            fake_rc_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
-
-            act_real_rc = classifier_model.predict(real_rc_data, batch_size=32, verbose=0)
-            act_fake_rc = classifier_model.predict(fake_rc_data, batch_size=32, verbose=0)
-
-            # FRD: 10 batches of 1000 (accumulated statistics)
-            frd_10k = TraditionalMetrics.frechet_distance_batched(
-                act_real_rc, act_fake_rc,
-                n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
-            )
-
-            # KRD remains unchanged
-            krd_10k = TraditionalMetrics.kernel_distance(act_real_rc[:n_samples], act_fake_rc[:n_samples])
-
-            # 500-sample versions unchanged
-            act_real_rc_500 = classifier_model.predict(real_data[:n_500], batch_size=32, verbose=0)
-            act_fake_rc_500 = classifier_model.predict(fake_data[:n_500], batch_size=32, verbose=0)
-
-            frd_500 = TraditionalMetrics.frechet_distance(act_real_rc_500, act_fake_rc_500)
-            krd_500 = TraditionalMetrics.kernel_distance(act_real_rc_500, act_fake_rc_500)
-        except Exception as e:
-            print(f"Warning: Could not load classifier from {classifier_path}: {e}")
-            frd_10k = frd_500 = krd_10k = krd_500 = 0.0
-
-        return {
-            'FID_10k': fid_10k,
-            'KID_10k': kid_10k,
-            'FID_500': fid_500,
-            'KID_500': kid_500,
-            'FRD_10k': frd_10k,
-            'KRD_10k': krd_10k,
-            'FRD_500': frd_500,
-            'KRD_500': krd_500
-        }
-
-
-class GaussianLatentValidator:
-    """Validates and enforces Gaussian distribution in latent space."""
-
-    @staticmethod
-    def test_normality(latent_vectors, significance_level=0.01):
-        results = {}
-
-        latent_flat = latent_vectors.flatten()
-
-        ks_statistic, ks_pvalue = kstest(latent_flat, 'norm', args=(0, 1))
-        results['ks_statistic'] = ks_statistic
-        results['ks_pvalue'] = ks_pvalue
-        results['is_gaussian_ks'] = ks_pvalue > significance_level
-
-        mean = np.mean(latent_flat)
-        std = np.std(latent_flat)
-        skewness = np.mean(((latent_flat - mean) / std) ** 3) if std > 0 else 0
-        kurtosis = np.mean(((latent_flat - mean) / std) ** 4) - 3
-
-        results['mean'] = mean
-        results['std'] = std
-        results['skewness'] = skewness
-        results['kurtosis'] = kurtosis
-
-        results['mean_match'] = abs(mean) < 0.1
-        results['std_match'] = abs(std - 1.0) < 0.1
-        results['skewness_match'] = abs(skewness) < 0.5
-        results['kurtosis_match'] = abs(kurtosis) < 1.0
-
-        results['gaussian_score'] = (
-                                            results['mean_match'] +
-                                            results['std_match'] +
-                                            results['skewness_match'] +
-                                            results['kurtosis_match']
-                                    ) / 4.0
-
-        return results
-
-    @staticmethod
-    def kl_divergence_gaussian(latent_vectors, epsilon=1e-10):
-        latent_flat = latent_vectors.flatten()
-
-        kde = gaussian_kde(latent_flat)
-
-        x_range = np.linspace(-4, 4, 1000)
-
-        latent_pdf = kde(x_range)
-        latent_pdf = latent_pdf / latent_pdf.sum()
-
-        normal_pdf = norm.pdf(x_range, 0, 1)
-        normal_pdf = normal_pdf / normal_pdf.sum()
-
-        kl_div = entropy(latent_pdf + epsilon, normal_pdf + epsilon)
-
-        return kl_div
-
-    @staticmethod
-    def visualize_latent_distribution(latent_vectors, epoch, save_dir='training_outputs/latent_analysis'):
-        os.makedirs(save_dir, exist_ok=True)
-
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        fig.suptitle(f'Latent Space Distribution Analysis - Epoch {epoch}',
-                     fontsize=20, fontweight='bold')
-
-        latent_flat = latent_vectors.flatten()
-
-        ax = axes[0, 0]
-        ax.hist(latent_flat, bins=100, density=True, alpha=0.7, label='Latent Space')
-        x_range = np.linspace(-4, 4, 1000)
-        ax.plot(x_range, norm.pdf(x_range, 0, 1), 'r-', linewidth=2, label='N(0,1)')
-        ax.set_title('Distribution vs Standard Normal')
-        ax.set_xlabel('Value')
-        ax.set_ylabel('Density')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-        ax = axes[0, 1]
-        from scipy import stats
-        stats.probplot(latent_flat[:10000], dist="norm", plot=ax)
-        ax.set_title('Q-Q Plot')
-        ax.grid(True, alpha=0.3)
-
-        ax = axes[0, 2]
-        dim_means = np.mean(latent_vectors, axis=0)
-        dim_stds = np.std(latent_vectors, axis=0)
-        ax.errorbar(range(len(dim_means[:50])), dim_means[:50], yerr=dim_stds[:50],
-                    fmt='o', alpha=0.6, capsize=2)
-        ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
-        ax.set_title('Per-Dimension Statistics (first 50)')
-        ax.set_xlabel('Dimension')
-        ax.set_ylabel('Mean ± Std')
-        ax.grid(True, alpha=0.3)
-
-        ax = axes[1, 0]
-        scatter = ax.scatter(latent_vectors[:5000, 0], latent_vectors[:5000, 1],
-                             alpha=0.5, s=1)
-        ax.set_title('2D Latent Space (dims 0,1)')
-        ax.set_xlabel('Dimension 0')
-        ax.set_ylabel('Dimension 1')
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
-
-        ax = axes[1, 1]
-        normality_results = GaussianLatentValidator.test_normality(latent_vectors)
-
-        text = f"Normality Test Results:\n\n"
-        text += f"Mean: {normality_results['mean']:.4f} (target: 0)\n"
-        text += f"Std: {normality_results['std']:.4f} (target: 1)\n"
-        text += f"Skewness: {normality_results['skewness']:.4f} (target: 0)\n"
-        text += f"Kurtosis: {normality_results['kurtosis']:.4f} (target: 0)\n\n"
-        text += f"KS p-value: {normality_results['ks_pvalue']:.4f}\n"
-        text += f"Gaussian Score: {normality_results['gaussian_score']:.2%}"
-
-        ax.text(0.1, 0.5, text, transform=ax.transAxes, fontsize=10,
-                verticalalignment='center', fontfamily='monospace',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        ax.axis('off')
-        ax.set_title('Normality Statistics')
-
-        ax = axes[1, 2]
-        kl_div = GaussianLatentValidator.kl_divergence_gaussian(latent_vectors)
-        ax.bar(['KL Divergence'], [kl_div], color='blue', alpha=0.7)
-        ax.set_title(f'KL Divergence: {kl_div:.4f}')
-        ax.set_ylabel('Value')
-        ax.grid(True, alpha=0.3, axis='y')
-
-        plt.tight_layout()
-
-        save_path = os.path.join(save_dir, f'latent_analysis_epoch_{epoch:04d}')
-        for fmt in HIGH_RES_CONFIG['save_formats']:
-            plt.savefig(f'{save_path}.{fmt}', dpi=HIGH_RES_CONFIG['dpi'],
-                        bbox_inches='tight', facecolor='white', edgecolor='none')
-        plt.close(fig)
-
-        return normality_results
-
-
+# ============================================================================
+# 3. MODEL ARCHITECTURE
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 3.1 Gaussian Regularized AdaIN layer
+# ----------------------------------------------------------------------------
 class GaussianRegularizedAdaIN(layers.Layer):
     """AdaIN with Gaussian regularization."""
 
@@ -776,6 +193,9 @@ class GaussianRegularizedAdaIN(layers.Layer):
         return config
 
 
+# ----------------------------------------------------------------------------
+# 3.2 Gaussian Stabilized Generator (with W-space access)
+# ----------------------------------------------------------------------------
 class GaussianStabilizedGenerator(tf.keras.Model):
     """Generator with enforced Gaussian latent space and W-space access."""
 
@@ -921,6 +341,9 @@ class GaussianStabilizedGenerator(tf.keras.Model):
         return cls(**config)
 
 
+# ----------------------------------------------------------------------------
+# 3.3 Feature Extracting Discriminator
+# ----------------------------------------------------------------------------
 class FeatureExtractingDiscriminator(tf.keras.Model):
     """StyleGAN2 Discriminator with feature extraction."""
 
@@ -1033,6 +456,9 @@ class FeatureExtractingDiscriminator(tf.keras.Model):
         return cls(**config)
 
 
+# ----------------------------------------------------------------------------
+# 3.4 StyleGAN2 composite model (with W-space support)
+# ----------------------------------------------------------------------------
 class StyleGAN2(keras.Model):
     """StyleGAN2 with enforced Gaussian latent space and W-space support."""
 
@@ -1308,7 +734,6 @@ class StyleGAN2(keras.Model):
             }
         }
 
-        import json
         with open(os.path.join(save_dir, 'model_config_w.json'), 'w') as f:
             json.dump(config, f, indent=4, default=str)
         print(f"   ✓ Configuration saved to: {os.path.join(save_dir, 'model_config_w.json')}")
@@ -1325,453 +750,639 @@ class StyleGAN2(keras.Model):
         return save_dir
 
 
-class SampleSaverCallback(tf.keras.callbacks.Callback):
-    """Callback to save samples and latent space analysis."""
+# ============================================================================
+# 4. METRICS & UTILITIES
+# ============================================================================
 
-    def __init__(self, generator, latent_dim, save_dir='training_outputs/samples',
-                 latent_analysis_interval=50):
-        super().__init__()
-        self.generator = generator
-        self.latent_dim = latent_dim
-        self.save_dir = save_dir
-        self.latent_analysis_interval = latent_analysis_interval
+# ----------------------------------------------------------------------------
+# 4.1 Memory optimizer
+# ----------------------------------------------------------------------------
+class MemoryOptimizer:
+    @staticmethod
+    def memory_usage():
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 ** 2
+
+    @staticmethod
+    def clear_memory():
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+    @staticmethod
+    def batch_generator(data, batch_size):
+        n_samples = len(data)
+        for i in range(0, n_samples, batch_size):
+            yield data[i:i + batch_size]
+
+    @staticmethod
+    def check_memory(threshold_mb=8000):
+        current_memory = MemoryOptimizer.memory_usage()
+        if current_memory > threshold_mb:
+            MemoryOptimizer.clear_memory()
+            print(f"Memory cleared. Current usage: {current_memory:.2f} MB")
+            return True
+        return False
+
+
+# ----------------------------------------------------------------------------
+# 4.2 Static geostatistical metrics
+# ----------------------------------------------------------------------------
+class StaticMetrics:
+    @staticmethod
+    def variogram_2d(data, lag_distances=None, max_lag=None):
+        if len(data.shape) == 4:
+            data = data[..., 0]
+
+        n_samples, height, width = data.shape[:3]
+
+        if lag_distances is None:
+            if max_lag is None:
+                max_lag = min(height, width) // 2
+            lag_distances = np.arange(1, max_lag + 1)
+
+        variogram = np.zeros(len(lag_distances))
+        counts = np.zeros(len(lag_distances))
+
+        for i in range(height):
+            for j in range(width):
+                for k, lag in enumerate(lag_distances):
+                    if j + lag < width:
+                        for sample in range(n_samples):
+                            diff = data[sample, i, j] - data[sample, i, j + lag]
+                            variogram[k] += diff ** 2
+                            counts[k] += 1
+
+                    if i + lag < height:
+                        for sample in range(n_samples):
+                            diff = data[sample, i, j] - data[sample, i + lag, j]
+                            variogram[k] += diff ** 2
+                            counts[k] += 1
+
+        variogram = variogram / (2 * counts)
+        variogram[counts == 0] = 0
+
+        return lag_distances, variogram
+
+    @staticmethod
+    def connectivity_function(data, threshold, lag_distances=None):
+        if len(data.shape) == 4:
+            data = data[..., 0]
+
+        n_samples, height, width = data.shape[:3]
+        binary_data = (data > threshold).astype(float)
+
+        if lag_distances is None:
+            max_lag = min(height, width) // 2
+            lag_distances = np.arange(1, max_lag + 1)
+
+        connectivity = np.zeros(len(lag_distances))
+
+        for k, lag in enumerate(lag_distances):
+            connected_pairs = 0
+            total_pairs = 0
+
+            for sample in range(n_samples):
+                for i in range(height):
+                    for j in range(width):
+                        if binary_data[sample, i, j] == 1:
+                            if j + lag < width and binary_data[sample, i, j + lag] == 1:
+                                connected_pairs += 1
+                            total_pairs += 1
+
+                            if i + lag < height and binary_data[sample, i + lag, j] == 1:
+                                connected_pairs += 1
+                            total_pairs += 1
+
+            if total_pairs > 0:
+                connectivity[k] = connected_pairs / total_pairs
+
+        return lag_distances, connectivity
+
+    @staticmethod
+    def calculate_histogram_kl(real_data, fake_data, bins=100, epsilon=1e-10):
+        if len(real_data.shape) == 4:
+            real_flat = real_data[..., 0].flatten()
+            fake_flat = fake_data[..., 0].flatten()
+        else:
+            real_flat = real_data.flatten()
+            fake_flat = fake_data.flatten()
+
+        min_val = min(real_flat.min(), fake_flat.min())
+        max_val = max(real_flat.max(), fake_flat.max())
+
+        hist_real, bin_edges = np.histogram(real_flat, bins=bins, range=(min_val, max_val), density=True)
+        hist_fake, _ = np.histogram(fake_flat, bins=bin_edges, density=True)
+
+        hist_real = hist_real + epsilon
+        hist_fake = hist_fake + epsilon
+
+        hist_real = hist_real / hist_real.sum()
+        hist_fake = hist_fake / hist_fake.sum()
+
+        kl_div = entropy(hist_real, hist_fake)
+
+        return kl_div, hist_real, hist_fake, bin_edges
+
+    @staticmethod
+    def calculate_pca_correlation(real_data, fake_data, n_components=50):
+        n_real = real_data.shape[0]
+        n_fake = fake_data.shape[0]
+
+        real_flat = real_data.reshape(n_real, -1)
+        fake_flat = fake_data.reshape(n_fake, -1)
+
+        combined_data = np.vstack([real_flat, fake_flat])
+
+        n_components = min(n_components, combined_data.shape[1], combined_data.shape[0])
+        pca = PCA(n_components=n_components)
+        pca.fit(combined_data)
+
+        real_pca = pca.transform(real_flat)
+        fake_pca = pca.transform(fake_flat)
+
+        correlations = []
+        for i in range(min(n_components, real_pca.shape[1], fake_pca.shape[1])):
+            if np.std(real_pca[:, i]) > 0 and np.std(fake_pca[:, i]) > 0:
+                corr = np.corrcoef(real_pca[:, i], fake_pca[:, i])[0, 1]
+                correlations.append(corr)
+
+        avg_correlation = np.mean(np.abs(correlations)) if correlations else 0
+
+        return avg_correlation, real_pca, fake_pca, pca.explained_variance_ratio_
+
+    @staticmethod
+    def calculate_mds_mmd(real_data, fake_data, subsample=500, kernel='rbf', gamma=None):
+        n_real = min(subsample, real_data.shape[0])
+        n_fake = min(subsample, fake_data.shape[0])
+
+        real_subsample = real_data[:n_real]
+        fake_subsample = fake_data[:n_fake]
+
+        real_flat = real_subsample.reshape(n_real, -1)
+        fake_flat = fake_subsample.reshape(n_fake, -1)
+
+        if n_real + n_fake > 100:
+            pca = PCA(n_components=min(50, real_flat.shape[1]))
+            combined = np.vstack([real_flat, fake_flat])
+            combined_pca = pca.fit_transform(combined)
+            real_mds = combined_pca[:n_real]
+            fake_mds = combined_pca[n_real:]
+        else:
+            mds = MDS(n_components=2, random_state=42, n_jobs=-1)
+            combined = np.vstack([real_flat, fake_flat])
+            combined_mds = mds.fit_transform(combined)
+            real_mds = combined_mds[:n_real]
+            fake_mds = combined_mds[n_real:]
+
+        def rbf_kernel(X, Y, gamma=None):
+            if gamma is None:
+                gamma = 1.0 / X.shape[1]
+
+            XX = np.sum(X ** 2, axis=1)[:, np.newaxis]
+            YY = np.sum(Y ** 2, axis=1)[:, np.newaxis]
+            XY = np.dot(X, Y.T)
+
+            distances = XX + YY.T - 2 * XY
+            return np.exp(-gamma * distances)
+
+        K_XX = rbf_kernel(real_mds, real_mds, gamma)
+        K_YY = rbf_kernel(fake_mds, fake_mds, gamma)
+        K_XY = rbf_kernel(real_mds, fake_mds, gamma)
+
+        mmd_squared = (K_XX.mean() + K_YY.mean() - 2 * K_XY.mean())
+        mmd = np.sqrt(max(mmd_squared, 0))
+
+        return mmd, real_mds, fake_mds
+
+    @staticmethod
+    def compute_all_metrics(real_data, fake_data, threshold=0.5, max_lag=25):
+        metrics = {}
+
+        print("Calculating all metrics...")
+
+        lags, variogram_real = StaticMetrics.variogram_2d(real_data[:100], max_lag=max_lag)
+        _, variogram_fake = StaticMetrics.variogram_2d(fake_data[:100], max_lag=max_lag)
+
+        metrics['variogram_lags'] = lags
+        metrics['variogram_real'] = variogram_real
+        metrics['variogram_fake'] = variogram_fake
+        metrics['variogram_mse'] = np.mean((variogram_real - variogram_fake) ** 2)
+
+        _, connectivity_real = StaticMetrics.connectivity_function(
+            real_data[:100], threshold, lag_distances=lags
+        )
+        _, connectivity_fake = StaticMetrics.connectivity_function(
+            fake_data[:100], threshold, lag_distances=lags
+        )
+
+        metrics['connectivity_real'] = connectivity_real
+        metrics['connectivity_fake'] = connectivity_fake
+        metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
+
+        kl_div, hist_real, hist_fake, bin_edges = StaticMetrics.calculate_histogram_kl(
+            real_data, fake_data, bins=100
+        )
+        metrics['hist_kl'] = kl_div
+        metrics['hist_real'] = hist_real
+        metrics['hist_fake'] = hist_fake
+        metrics['hist_bin_edges'] = bin_edges
+
+        pca_corr, real_pca, fake_pca, var_ratio = StaticMetrics.calculate_pca_correlation(
+            real_data, fake_data, n_components=50
+        )
+        metrics['pca_correlation'] = pca_corr
+        metrics['pca_real'] = real_pca[:, :2] if real_pca.shape[1] >= 2 else real_pca
+        metrics['pca_fake'] = fake_pca[:, :2] if fake_pca.shape[1] >= 2 else fake_pca
+        metrics['pca_var_ratio'] = var_ratio
+
+        mmd, real_mds, fake_mds = StaticMetrics.calculate_mds_mmd(
+            real_data, fake_data, subsample=500
+        )
+        metrics['mds_mmd'] = mmd
+        metrics['mds_real'] = real_mds
+        metrics['mds_fake'] = fake_mds
+
+        return metrics
+
+
+# ----------------------------------------------------------------------------
+# 4.3 Traditional metrics (FID/KID/FRD/KRD)
+# ----------------------------------------------------------------------------
+class TraditionalMetrics:
+    _inception_model = None
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_inception(cls, shape):
+        from keras.applications.inception_v3 import InceptionV3
+        if cls._inception_model is None:
+            cls._inception_model = InceptionV3(
+                include_top=False,
+                pooling='avg',
+                input_shape=(shape[0], shape[1], 3)
+            )
+        return cls._inception_model
+
+    @staticmethod
+    def get_classifier(filepath):
+        RC_full = tf.keras.models.load_model(filepath)
+        f_extraction = tf.keras.Model(
+            inputs=RC_full.input,
+            outputs=layers.GlobalAveragePooling2D()(RC_full.layers[-5].output)
+        )
+        return f_extraction
+
+    @staticmethod
+    def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+        # ------------------------------------------------------------------
+        # FID FIX:
+        # Adds an epsilon regularizer to the diagonal of the covariance
+        # matrices before computing the matrix square root. This is the
+        # standard practice (official TensorFlow FID / original FID paper) and
+        # prevents sqrtm from producing huge NaN/Inf/complex values when
+        # the covariance matrices are ill-conditioned.
+        # ------------------------------------------------------------------
+        mu1 = np.atleast_1d(mu1).astype(np.float64)
+        mu2 = np.atleast_1d(mu2).astype(np.float64)
+        sigma1 = np.atleast_2d(sigma1).astype(np.float64)
+        sigma2 = np.atleast_2d(sigma2).astype(np.float64)
+
+        diff = mu1 - mu2
+
+        # Numerical regularization: ensures dominant diagonal
+        sigma1 = sigma1 + np.eye(sigma1.shape[0]) * eps
+        sigma2 = sigma2 + np.eye(sigma2.shape[0]) * eps
+
+        # Computes sqrtm of the product with non-finite handling
+        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+
+        if not np.isfinite(covmean).all():
+            offset = np.eye(sigma1.shape[0]) * eps
+            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+
+        if np.iscomplexobj(covmean):
+            if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+                m = np.max(np.abs(covmean.imag))
+                raise ValueError(f"Imaginary component {m}")
+            covmean = covmean.real
+
+        tr_covmean = np.trace(covmean)
+
+        fid = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2.0 * tr_covmean
+        return float(fid)
+
+    @staticmethod
+    def frechet_distance(real_features, fake_features):
+        mu1, sigma1 = np.mean(real_features, axis=0), np.cov(real_features, rowvar=False)
+        mu2, sigma2 = np.mean(fake_features, axis=0), np.cov(fake_features, rowvar=False)
+
+        fid_value = TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+        return fid_value
+
+    @staticmethod
+    def frechet_distance_batched(real_features, fake_features, n_batches=10, batch_size=1000):
+        """
+        Computes the Frechet Distance using batched computation over 10 batches of 1000 samples.
+        Accumulates the statistics (mean and covariance) incrementally between batches.
+        """
+        real_features = np.asarray(real_features, dtype=np.float64)
+        fake_features = np.asarray(fake_features, dtype=np.float64)
+
+        # Accumulate statistics for the real features
+        real_sum = np.zeros(real_features.shape[1], dtype=np.float64)
+        real_sum_sq = np.zeros((real_features.shape[1], real_features.shape[1]), dtype=np.float64)
+        real_count = 0
+
+        for i in range(n_batches):
+            start = i * batch_size
+            end = start + batch_size
+            batch = real_features[start:end]
+            real_sum += batch.sum(axis=0)
+            real_sum_sq += batch.T @ batch
+            real_count += batch.shape[0]
+
+        mu1 = real_sum / real_count
+        sigma1 = (real_sum_sq / real_count) - np.outer(mu1, mu1)
+
+        # Accumulate statistics for the generated features
+        fake_sum = np.zeros(fake_features.shape[1], dtype=np.float64)
+        fake_sum_sq = np.zeros((fake_features.shape[1], fake_features.shape[1]), dtype=np.float64)
+        fake_count = 0
+
+        for i in range(n_batches):
+            start = i * batch_size
+            end = start + batch_size
+            batch = fake_features[start:end]
+            fake_sum += batch.sum(axis=0)
+            fake_sum_sq += batch.T @ batch
+            fake_count += batch.shape[0]
+
+        mu2 = fake_sum / fake_count
+        sigma2 = (fake_sum_sq / fake_count) - np.outer(mu2, mu2)
+
+        if sigma1.ndim == 0: sigma1 = np.array([[sigma1]])
+        if sigma2.ndim == 0: sigma2 = np.array([[sigma2]])
+
+        return TraditionalMetrics.calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+
+    @staticmethod
+    def kernel_distance(real_features, fake_features, num_blocks=100, max_block_size=1000):
+        n_samples = min(len(real_features), len(fake_features))
+        block_size = min(max_block_size, n_samples // num_blocks)
+
+        kid_scores = []
+        for _ in range(num_blocks):
+            idx_real = np.random.choice(len(real_features), block_size, replace=False)
+            idx_fake = np.random.choice(len(fake_features), block_size, replace=False)
+
+            real_block = real_features[idx_real]
+            fake_block = fake_features[idx_fake]
+
+            gamma = 1.0 / real_block.shape[1]
+            K_XX = pairwise_kernels(real_block, real_block, metric='rbf', gamma=gamma)
+            K_YY = pairwise_kernels(fake_block, fake_block, metric='rbf', gamma=gamma)
+            K_XY = pairwise_kernels(real_block, fake_block, metric='rbf', gamma=gamma)
+
+            kid = (K_XX.mean() + K_YY.mean() - 2 * K_XY.mean())
+            kid_scores.append(kid)
+
+        return np.mean(kid_scores)
+
+    @staticmethod
+    def compute_all_traditional_metrics(real_data, fake_data, classifier_path='Reservoir_classifier.h5'):
+        """Computes all traditional metrics.
+
+        FID and FRD are computed with 10000 samples split into 10 batches of 1000,
+        accumulating the statistics (mean and covariance) incrementally.
+        """
+        print("Calculating traditional metrics...")
+
+        # Ensure exactly 10000 samples for batched FID/FRD (10 batches x 1000)
+        FID_N_BATCHES = 10
+        FID_BATCH_SIZE = 1000
+        FID_TOTAL = FID_N_BATCHES * FID_BATCH_SIZE  # 10000
+
+        n_available = min(len(real_data), len(fake_data))
+        n_fid = min(FID_TOTAL, n_available)
+
+        # If fewer than 10000 samples available, adjust batch size
+        if n_fid < FID_TOTAL:
+            FID_N_BATCHES = max(1, n_fid // FID_BATCH_SIZE)
+            if FID_N_BATCHES == 0:
+                FID_N_BATCHES = 1
+                FID_BATCH_SIZE = n_fid
+            else:
+                FID_BATCH_SIZE = n_fid // FID_N_BATCHES
+
+        real_fid_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+        fake_fid_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+
+        # Prepare inputs for InceptionV3 (75x75x3)
+        real_resized = tf.image.resize(np.repeat(real_fid_data, 3, axis=3), [75, 75])
+        fake_resized = tf.image.resize(np.repeat(fake_fid_data, 3, axis=3), [75, 75])
+
+        inception_model = TraditionalMetrics.get_inception((75, 75, 3))
+        act_real_iv3 = inception_model.predict(real_resized, batch_size=32, verbose=0)
+        act_fake_iv3 = inception_model.predict(fake_resized, batch_size=32, verbose=0)
+
+        # FID: 10 batches of 1000 (accumulated statistics)
+        fid_10k = TraditionalMetrics.frechet_distance_batched(
+            act_real_iv3, act_fake_iv3,
+            n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
+        )
+
+        # KID remains unchanged (full set / existing behavior)
+        n_samples = min(10000, len(real_data), len(fake_data))
+        kid_10k = TraditionalMetrics.kernel_distance(act_real_iv3[:n_samples], act_fake_iv3[:n_samples])
+
+        n_500 = min(500, len(real_data), len(fake_data))
+        fid_500 = TraditionalMetrics.frechet_distance(act_real_iv3[:n_500], act_fake_iv3[:n_500])
+        kid_500 = TraditionalMetrics.kernel_distance(act_real_iv3[:n_500], act_fake_iv3[:n_500])
+
+        try:
+            classifier_model = TraditionalMetrics.get_classifier(classifier_path)
+
+            # Prepare inputs for the RC classifier
+            real_rc_data = real_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+            fake_rc_data = fake_data[:FID_N_BATCHES * FID_BATCH_SIZE]
+
+            act_real_rc = classifier_model.predict(real_rc_data, batch_size=32, verbose=0)
+            act_fake_rc = classifier_model.predict(fake_rc_data, batch_size=32, verbose=0)
+
+            # FRD: 10 batches of 1000 (accumulated statistics)
+            frd_10k = TraditionalMetrics.frechet_distance_batched(
+                act_real_rc, act_fake_rc,
+                n_batches=FID_N_BATCHES, batch_size=FID_BATCH_SIZE
+            )
+
+            # KRD remains unchanged
+            krd_10k = TraditionalMetrics.kernel_distance(act_real_rc[:n_samples], act_fake_rc[:n_samples])
+
+            # 500-sample versions unchanged
+            act_real_rc_500 = classifier_model.predict(real_data[:n_500], batch_size=32, verbose=0)
+            act_fake_rc_500 = classifier_model.predict(fake_data[:n_500], batch_size=32, verbose=0)
+
+            frd_500 = TraditionalMetrics.frechet_distance(act_real_rc_500, act_fake_rc_500)
+            krd_500 = TraditionalMetrics.kernel_distance(act_real_rc_500, act_fake_rc_500)
+        except Exception as e:
+            print(f"Warning: Could not load classifier from {classifier_path}: {e}")
+            frd_10k = frd_500 = krd_10k = krd_500 = 0.0
+
+        return {
+            'FID_10k': fid_10k,
+            'KID_10k': kid_10k,
+            'FID_500': fid_500,
+            'KID_500': kid_500,
+            'FRD_10k': frd_10k,
+            'KRD_10k': krd_10k,
+            'FRD_500': frd_500,
+            'KRD_500': krd_500
+        }
+
+
+# ----------------------------------------------------------------------------
+# 4.4 Gaussian latent validator
+# ----------------------------------------------------------------------------
+class GaussianLatentValidator:
+    """Validates and enforces Gaussian distribution in latent space."""
+
+    @staticmethod
+    def test_normality(latent_vectors, significance_level=0.01):
+        results = {}
+
+        latent_flat = latent_vectors.flatten()
+
+        ks_statistic, ks_pvalue = kstest(latent_flat, 'norm', args=(0, 1))
+        results['ks_statistic'] = ks_statistic
+        results['ks_pvalue'] = ks_pvalue
+        results['is_gaussian_ks'] = ks_pvalue > significance_level
+
+        mean = np.mean(latent_flat)
+        std = np.std(latent_flat)
+        skewness = np.mean(((latent_flat - mean) / std) ** 3) if std > 0 else 0
+        kurtosis = np.mean(((latent_flat - mean) / std) ** 4) - 3
+
+        results['mean'] = mean
+        results['std'] = std
+        results['skewness'] = skewness
+        results['kurtosis'] = kurtosis
+
+        results['mean_match'] = abs(mean) < 0.1
+        results['std_match'] = abs(std - 1.0) < 0.1
+        results['skewness_match'] = abs(skewness) < 0.5
+        results['kurtosis_match'] = abs(kurtosis) < 1.0
+
+        results['gaussian_score'] = (
+                                            results['mean_match'] +
+                                            results['std_match'] +
+                                            results['skewness_match'] +
+                                            results['kurtosis_match']
+                                    ) / 4.0
+
+        return results
+
+    @staticmethod
+    def kl_divergence_gaussian(latent_vectors, epsilon=1e-10):
+        latent_flat = latent_vectors.flatten()
+
+        kde = gaussian_kde(latent_flat)
+
+        x_range = np.linspace(-4, 4, 1000)
+
+        latent_pdf = kde(x_range)
+        latent_pdf = latent_pdf / latent_pdf.sum()
+
+        normal_pdf = norm.pdf(x_range, 0, 1)
+        normal_pdf = normal_pdf / normal_pdf.sum()
+
+        kl_div = entropy(latent_pdf + epsilon, normal_pdf + epsilon)
+
+        return kl_div
+
+    @staticmethod
+    def visualize_latent_distribution(latent_vectors, epoch, save_dir='training_outputs/latent_analysis'):
         os.makedirs(save_dir, exist_ok=True)
 
-    def on_epoch_end(self, epoch, logs=None):
-        noise = np.random.normal(0, 1, (6, self.latent_dim))
-        samples = self.generator.predict(noise, verbose=0)
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig.suptitle(f'Latent Space Distribution Analysis - Epoch {epoch}',
+                     fontsize=20, fontweight='bold')
 
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        fig.suptitle(f'Generated Samples - Epoch {epoch + 1}',
-                     fontsize=HIGH_RES_CONFIG['title_font_size'],
-                     fontweight='bold')
+        latent_flat = latent_vectors.flatten()
 
-        for i, ax in enumerate(axes.flat):
-            if i < 6:
-                im = ax.imshow(samples[i, ..., 0], cmap='viridis', aspect='auto')
-                ax.set_title(f'Sample {i + 1}', fontsize=HIGH_RES_CONFIG['font_size'],
-                             fontweight='bold')
-                ax.axis('off')
+        ax = axes[0, 0]
+        ax.hist(latent_flat, bins=100, density=True, alpha=0.7, label='Latent Space')
+        x_range = np.linspace(-4, 4, 1000)
+        ax.plot(x_range, norm.pdf(x_range, 0, 1), 'r-', linewidth=2, label='N(0,1)')
+        ax.set_title('Distribution vs Standard Normal')
+        ax.set_xlabel('Value')
+        ax.set_ylabel('Density')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[0, 1]
+        from scipy import stats
+        stats.probplot(latent_flat[:10000], dist="norm", plot=ax)
+        ax.set_title('Q-Q Plot')
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[0, 2]
+        dim_means = np.mean(latent_vectors, axis=0)
+        dim_stds = np.std(latent_vectors, axis=0)
+        ax.errorbar(range(len(dim_means[:50])), dim_means[:50], yerr=dim_stds[:50],
+                    fmt='o', alpha=0.6, capsize=2)
+        ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+        ax.set_title('Per-Dimension Statistics (first 50)')
+        ax.set_xlabel('Dimension')
+        ax.set_ylabel('Mean ± Std')
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[1, 0]
+        scatter = ax.scatter(latent_vectors[:5000, 0], latent_vectors[:5000, 1],
+                             alpha=0.5, s=1)
+        ax.set_title('2D Latent Space (dims 0,1)')
+        ax.set_xlabel('Dimension 0')
+        ax.set_ylabel('Dimension 1')
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[1, 1]
+        normality_results = GaussianLatentValidator.test_normality(latent_vectors)
+
+        text = f"Normality Test Results:\n\n"
+        text += f"Mean: {normality_results['mean']:.4f} (target: 0)\n"
+        text += f"Std: {normality_results['std']:.4f} (target: 1)\n"
+        text += f"Skewness: {normality_results['skewness']:.4f} (target: 0)\n"
+        text += f"Kurtosis: {normality_results['kurtosis']:.4f} (target: 0)\n\n"
+        text += f"KS p-value: {normality_results['ks_pvalue']:.4f}\n"
+        text += f"Gaussian Score: {normality_results['gaussian_score']:.2%}"
+
+        ax.text(0.1, 0.5, text, transform=ax.transAxes, fontsize=10,
+                verticalalignment='center', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        ax.axis('off')
+        ax.set_title('Normality Statistics')
+
+        ax = axes[1, 2]
+        kl_div = GaussianLatentValidator.kl_divergence_gaussian(latent_vectors)
+        ax.bar(['KL Divergence'], [kl_div], color='blue', alpha=0.7)
+        ax.set_title(f'KL Divergence: {kl_div:.4f}')
+        ax.set_ylabel('Value')
+        ax.grid(True, alpha=0.3, axis='y')
 
         plt.tight_layout()
 
-        base_path = os.path.join(self.save_dir, f'samples_epoch_{epoch + 1:04d}')
-        plt.savefig(f"{base_path}.png", dpi=HIGH_RES_CONFIG['dpi'],
-                    bbox_inches='tight', facecolor='white', edgecolor='none')
-        plt.savefig(f"{base_path}.svg", format='svg', bbox_inches='tight',
-                    facecolor='white', edgecolor='none')
-        plt.close(fig)
-
-        np.save(os.path.join(self.save_dir, f'samples_epoch_{epoch + 1:04d}.npy'), samples)
-
-        if (epoch + 1) % self.latent_analysis_interval == 0:
-            print(f"\nAnalyzing latent space gaussianity at epoch {epoch + 1}...")
-            latent_noise = np.random.normal(0, 1, (5000, self.latent_dim))
-            GaussianLatentValidator.visualize_latent_distribution(
-                latent_noise, epoch + 1,
-                save_dir='training_outputs/latent_analysis'
-            )
-            print(f"✓ Latent space analysis saved for epoch {epoch + 1}")
-
-
-class EnhancedMetricCallback(tf.keras.callbacks.Callback):
-    """Enhanced callback to compute all metrics every 10 epochs."""
-
-    def __init__(self, generator, x_test, latent_dim, metric_interval=10,
-                 log_file='training_metrics.txt', save_dir='training_outputs/metrics'):
-        super().__init__()
-        self.generator = generator
-        self.x_test = x_test
-        self.latent_dim = latent_dim
-        self.metric_interval = metric_interval
-        self.log_file = log_file
-        self.save_dir = save_dir
-
-        os.makedirs(save_dir, exist_ok=True)
-
-        self.traditional_metrics = {
-            'FID_10k': [], 'FRD_10k': [], 'KID_10k': [], 'KRD_10k': [],
-            'FID_500': [], 'FRD_500': [], 'KID_500': [], 'KRD_500': []
-        }
-
-        self.static_metrics = {
-            'Variogram_MSE': [],
-            'Connectivity_MSE': [],
-            'Histogram_KL': [],
-            'PCA_Correlation': [],
-            'MDS_MMD': []
-        }
-
-        with open(self.log_file, 'w') as f:
-            header = "Epoch\t"
-            header += "\t".join(self.traditional_metrics.keys()) + "\t"
-            header += "\t".join(self.static_metrics.keys()) + "\n"
-            f.write(header)
-
-        self.history = {
-            'g_loss': [],
-            'd_loss': []
-        }
-
-    def on_epoch_end(self, epoch, logs=None):
-        if logs:
-            self.history['g_loss'].append(logs.get('g_loss', 0))
-            self.history['d_loss'].append(logs.get('d_loss', 0))
-
-        if (epoch + 1) % self.metric_interval == 0:
-            print(f'\n{"=" * 60}')
-            print(f'Computing ALL metrics at epoch {epoch + 1}')
-            print(f'{"=" * 60}')
-
-            size = min(500, self.x_test.shape[0])
-            noise = np.random.normal(0, 1, (size, self.latent_dim))
-            fake_data = self.generator.predict(noise, verbose=0, batch_size=16)
-            real_data = self.x_test[:size]
-
-            try:
-                traditional_results = TraditionalMetrics.compute_all_traditional_metrics(
-                    real_data, fake_data
-                )
-
-                for key in traditional_results:
-                    if abs(traditional_results[key]) > 1e6:
-                        print(f"Warning: {key} has extreme value: {traditional_results[key]:.2e}")
-                        traditional_results[key] = 100.0 if 'FID' in key or 'FRD' in key else 1.0
-            except Exception as e:
-                print(f"Error calculating traditional metrics: {e}")
-                traditional_results = {
-                    'FID_10k': 100.0, 'FID_500': 100.0,
-                    'KID_10k': 1.0, 'KID_500': 1.0,
-                    'FRD_10k': 100.0, 'FRD_500': 100.0,
-                    'KRD_10k': 1.0, 'KRD_500': 1.0
-                }
-
-            try:
-                static_results = StaticMetrics.compute_all_metrics(real_data, fake_data)
-                static_summary = {
-                    'Variogram_MSE': static_results['variogram_mse'],
-                    'Connectivity_MSE': static_results['connectivity_mse'],
-                    'Histogram_KL': static_results['hist_kl'],
-                    'PCA_Correlation': static_results['pca_correlation'],
-                    'MDS_MMD': static_results['mds_mmd']
-                }
-            except Exception as e:
-                print(f"Error calculating static metrics: {e}")
-                static_summary = {
-                    'Variogram_MSE': 1.0,
-                    'Connectivity_MSE': 1.0,
-                    'Histogram_KL': 10.0,
-                    'PCA_Correlation': 0.0,
-                    'MDS_MMD': 1.0
-                }
-
-            for key in self.traditional_metrics:
-                self.traditional_metrics[key].append(traditional_results[key])
-
-            for key in self.static_metrics:
-                self.static_metrics[key].append(static_summary[key])
-
-            self.save_metrics_to_file(epoch + 1, traditional_results, static_summary)
-            self.display_metrics(epoch + 1, traditional_results, static_summary)
-            self.save_numpy_files()
-
-            try:
-                self.plot_metrics_comparison(epoch + 1, static_results)
-            except Exception as e:
-                print(f"Error plotting metrics: {e}")
-
-    def save_metrics_to_file(self, epoch, traditional_metrics, static_metrics):
-        with open(self.log_file, 'a') as f:
-            f.write(f"{epoch}\t")
-            for key in self.traditional_metrics.keys():
-                f.write(f"{traditional_metrics[key]:.4f}\t")
-            for key in self.static_metrics.keys():
-                f.write(f"{static_metrics[key]:.4f}\t")
-            f.write("\n")
-
-    def display_metrics(self, epoch, traditional_metrics, static_metrics):
-        output = (
-            f"\nEpoch {epoch} - ALL METRICS:\n"
-            f"{'=' * 70}\n"
-            f"Traditional Metrics:\n"
-            f"  FID (10k): {traditional_metrics['FID_10k']:.4f}  "
-            f"FID (500): {traditional_metrics['FID_500']:.4f}\n"
-            f"  KID (10k): {traditional_metrics['KID_10k']:.4f}  "
-            f"KID (500): {traditional_metrics['KID_500']:.4f}\n"
-            f"  FRD (10k): {traditional_metrics['FRD_10k']:.4f}  "
-            f"FRD (500): {traditional_metrics['FRD_500']:.4f}\n"
-            f"  KRD (10k): {traditional_metrics['KRD_10k']:.4f}  "
-            f"KRD (500): {traditional_metrics['KRD_500']:.4f}\n"
-            f"{'=' * 70}\n"
-            f"Static Geostatistical Metrics:\n"
-            f"  Variogram MSE: {static_metrics['Variogram_MSE']:.6f}\n"
-            f"  Connectivity MSE: {static_metrics['Connectivity_MSE']:.6f}\n"
-            f"  Histogram KL: {static_metrics['Histogram_KL']:.6f}\n"
-            f"  PCA Correlation: {static_metrics['PCA_Correlation']:.6f}\n"
-            f"  MDS MMD: {static_metrics['MDS_MMD']:.6f}\n"
-            f"{'=' * 70}"
-        )
-        print(output)
-
-    def save_numpy_files(self):
-        for key, values in self.traditional_metrics.items():
-            np.save(f'{self.save_dir}/{key}.npy', values)
-        for key, values in self.static_metrics.items():
-            np.save(f'{self.save_dir}/{key}.npy', values)
-        np.save(f'{self.save_dir}/g_loss.npy', self.history['g_loss'])
-        np.save(f'{self.save_dir}/d_loss.npy', self.history['d_loss'])
-
-    def plot_metrics_comparison(self, epoch, static_results):
-        fig, axes = plt.subplots(2, 3, figsize=(22 * HIGH_RES_CONFIG['figsize_multiplier'],
-                                                14 * HIGH_RES_CONFIG['figsize_multiplier']),
-                                 dpi=HIGH_RES_CONFIG['dpi'])
-        fig.suptitle(f'Static Metrics Comparison - Epoch {epoch}',
-                     fontsize=HIGH_RES_CONFIG['title_font_size'] + 2,
-                     fontweight='bold')
-
-        ax = axes[0, 0]
-        lags = static_results['variogram_lags']
-        ax.plot(lags, static_results['variogram_real'], 'b-',
-                linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
-        ax.plot(lags, static_results['variogram_fake'], 'r--',
-                linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-        ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_ylabel('Variogram', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_title(f'Variogram (MSE: {static_results["variogram_mse"]:.4f})',
-                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
-        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
-
-        ax = axes[0, 1]
-        ax.plot(lags, static_results['connectivity_real'], 'b-',
-                linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
-        ax.plot(lags, static_results['connectivity_fake'], 'r--',
-                linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-        ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_ylabel('Connectivity', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_title(f'Connectivity (MSE: {static_results["connectivity_mse"]:.4f})',
-                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
-        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
-
-        ax = axes[0, 2]
-        bin_centers = (static_results['hist_bin_edges'][:-1] + static_results['hist_bin_edges'][1:]) / 2
-        bar_width = bin_centers[1] - bin_centers[0] if len(bin_centers) > 1 else 0.1
-        ax.bar(bin_centers, static_results['hist_real'], width=bar_width,
-               alpha=0.6, label='Real', color='blue', edgecolor='black', linewidth=1.0)
-        ax.plot(bin_centers, static_results['hist_fake'], 'r-',
-                linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-        ax.set_xlabel('Value', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_ylabel('Density', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_title(f'Histogram (KL: {static_results["hist_kl"]:.4f})',
-                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
-        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
-
-        ax = axes[1, 0]
-        ax.scatter(static_results['pca_real'][:, 0], static_results['pca_real'][:, 1],
-                   alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
-                   color='blue', edgecolor='black', linewidth=1.0)
-        ax.scatter(static_results['pca_fake'][:, 0], static_results['pca_fake'][:, 1],
-                   alpha=0.6, label='Generated', s=HIGH_RES_CONFIG['marker_size'],
-                   color='red', edgecolor='black', linewidth=1.0)
-        ax.set_xlabel('PC1', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_ylabel('PC2', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_title(f'PCA (Correlation: {static_results["pca_correlation"]:.4f})',
-                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
-        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
-
-        ax = axes[1, 1]
-        ax.scatter(static_results['mds_real'][:, 0], static_results['mds_real'][:, 1],
-                   alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
-                   color='blue', edgecolor='black', linewidth=1.0)
-        ax.scatter(static_results['mds_fake'][:, 0], static_results['mds_fake'][:, 1],
-                   alpha=0.6, label='Generated', s=HIGH_RES_CONFIG['marker_size'],
-                   color='red', edgecolor='black', linewidth=1.0)
-        ax.set_xlabel('MDS Dimension 1', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_ylabel('MDS Dimension 2', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_title(f'MDS (MMD: {static_results["mds_mmd"]:.4f})',
-                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
-        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
-
-        ax = axes[1, 2]
-        summary_metrics = ['Variogram\nMSE', 'Connectivity\nMSE', 'Histogram\nKL', 'PCA\nCorrelation', 'MDS\nMMD']
-        summary_values = [
-            static_results['variogram_mse'],
-            static_results['connectivity_mse'],
-            static_results['hist_kl'],
-            static_results['pca_correlation'],
-            static_results['mds_mmd']
-        ]
-        colors = ['blue', 'green', 'orange', 'red', 'purple']
-        bars = ax.bar(summary_metrics, summary_values, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
-        ax.set_ylabel('Value', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
-        ax.set_title('Summary of Static Metrics', fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
-
-        for bar, val in zip(bars, summary_values):
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width() / 2., height + 0.01,
-                    f'{val:.4f}', ha='center', va='bottom', fontsize=HIGH_RES_CONFIG['font_size'] - 2,
-                    fontweight='bold')
-
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-
-        base_path = f'{self.save_dir}/metrics_epoch_{epoch:04d}'
-        plt.savefig(f'{base_path}.png', dpi=HIGH_RES_CONFIG['dpi'], bbox_inches='tight')
-        plt.savefig(f'{base_path}.svg', format='svg', bbox_inches='tight')
-        plt.close(fig)
-
-
-class ImprovedStabilizationCallback(tf.keras.callbacks.Callback):
-    """Improved callback to stabilize training."""
-
-    def __init__(self, threshold_ratio=0.8):
-        super().__init__()
-        self.threshold_ratio = threshold_ratio
-        self.patience = 5
-        self.wait = 0
-        self.best_d_loss = float('inf')
-
-    def on_epoch_end(self, epoch, logs=None):
-        if logs:
-            d_loss = logs.get('d_loss', 0)
-            g_loss = logs.get('g_loss', 0)
-            d_real = logs.get('d_real', 0)
-            d_fake = logs.get('d_fake', 0)
-            grad_norm_g = logs.get('grad_norm_g', 0)
-
-            d_too_confident = (abs(d_real) > 5.0 or abs(d_fake) > 5.0)
-            loss_imbalance = (g_loss / max(d_loss, 1e-8)) > 10.0
-            grad_exploding = grad_norm_g > 100.0
-
-            if d_too_confident or loss_imbalance or grad_exploding:
-                print(f"\n STABILIZATION NEEDED at epoch {epoch + 1}:")
-
-                if d_too_confident:
-                    print(f"   Discriminator too confident: d_real={d_real:.4f}, d_fake={d_fake:.4f}")
-                    new_smoothing = min(0.3, self.model.label_smoothing * 1.5)
-                    self.model.label_smoothing = new_smoothing
-                    print(f"   Increased label smoothing to: {new_smoothing:.3f}")
-
-                if loss_imbalance:
-                    print(f"   Loss imbalance: g_loss={g_loss:.4f}, d_loss={d_loss:.4f} (ratio: {g_loss / d_loss:.2f})")
-
-                if grad_exploding:
-                    print(f"   Gradient exploding: grad_norm_g={grad_norm_g:.4f}")
-                    new_clip = max(0.1, self.model.gradient_clip * 0.5)
-                    self.model.gradient_clip = new_clip
-                    print(f"   Reduced gradient clip to: {new_clip:.3f}")
-
-            if d_loss < self.best_d_loss:
-                self.best_d_loss = d_loss
-                self.wait = 0
-            else:
-                self.wait += 1
-                if self.wait >= self.patience:
-                    current_lr_g = float(self.model.g_optimizer.learning_rate)
-                    current_lr_d = float(self.model.d_optimizer.learning_rate)
-
-                    new_lr_g = current_lr_g * 0.9
-                    new_lr_d = current_lr_d * 0.9
-
-                    self.model.g_optimizer.learning_rate.assign(new_lr_g)
-                    self.model.d_optimizer.learning_rate.assign(new_lr_d)
-
-                    print(f"\n📉 Reducing learning rates: G={new_lr_g:.6f}, D={new_lr_d:.6f}")
-                    self.wait = 0
-
-
-class AdaptiveLearningRateScheduler(tf.keras.callbacks.Callback):
-    """Adaptive learning rate scheduler based on metrics."""
-
-    def __init__(self, initial_lr_g=0.0001, initial_lr_d=0.0004):
-        super().__init__()
-        self.initial_lr_g = initial_lr_g
-        self.initial_lr_d = initial_lr_d
-        self.stable_epochs = 0
-
-    def on_epoch_end(self, epoch, logs=None):
-        if logs:
-            d_real = logs.get('d_real', 0)
-            d_fake = logs.get('d_fake', 0)
-
-            d_balance = abs(d_real + d_fake) < 0.5
-
-            if d_balance:
-                self.stable_epochs += 1
-                if self.stable_epochs >= 10:
-                    current_lr_g = float(self.model.g_optimizer.learning_rate)
-                    current_lr_d = float(self.model.d_optimizer.learning_rate)
-
-                    new_lr_g = min(self.initial_lr_g, current_lr_g * 1.1)
-                    new_lr_d = min(self.initial_lr_d, current_lr_d * 1.1)
-
-                    self.model.g_optimizer.learning_rate.assign(new_lr_g)
-                    self.model.d_optimizer.learning_rate.assign(new_lr_d)
-
-                    if new_lr_g != current_lr_g or new_lr_d != current_lr_d:
-                        print(f"\n Increasing learning rates (stable training): "
-                              f"G={new_lr_g:.6f}, D={new_lr_d:.6f}")
-
-                    self.stable_epochs = 0
-            else:
-                self.stable_epochs = 0
-
-
-class LivePlotCallback(keras.callbacks.Callback):
-    def __init__(self, model, data, num_images=10):
-        super().__init__()
-        self.model = model
-        self.data = data
-        self.num_images = num_images
-
-        self.fig_width = num_images * 4 * HIGH_RES_CONFIG['figsize_multiplier']
-        self.fig_height = 4 * HIGH_RES_CONFIG['figsize_multiplier']
-
-        self.fig, self.ax = plt.subplots(1, num_images * 2,
-                                         figsize=(self.fig_width, self.fig_height),
-                                         dpi=HIGH_RES_CONFIG['dpi'])
-
-        plt.ion()
-
-    def on_epoch_end(self, epoch, logs=None):
-        indices = np.random.randint(0, self.data.shape[0], self.num_images)
-        original_imgs = self.data[indices]
-
-        noise = np.random.normal(0, 1, (self.num_images, latent_dim))
-        generated_imgs = self.model.generator.predict(noise, verbose=0)
-
-        for i in range(self.num_images):
-            self.ax[i * 2].imshow(original_imgs[i].squeeze(), cmap='viridis', interpolation='nearest', vmin=-1, vmax=1)
-            self.ax[i * 2].set_title("Original", fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'] - 12)
-            self.ax[i * 2].axis('off')
-
-            self.ax[i * 2 + 1].imshow(generated_imgs[i].squeeze(), cmap='viridis', interpolation='nearest', vmin=-1,
-                                      vmax=1)
-            self.ax[i * 2 + 1].set_title(f"Generated", fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'] - 12)
-            self.ax[i * 2 + 1].axis('off')
-
-        self.fig.suptitle(f'Epoch {epoch + 1}: Original vs Generated Samples',
-                          fontsize=HIGH_RES_CONFIG['title_font_size'] - 8, fontweight='bold')
-
+        save_path = os.path.join(save_dir, f'latent_analysis_epoch_{epoch:04d}')
         for fmt in HIGH_RES_CONFIG['save_formats']:
-            filename = f"training_outputs/training_live_epoch_{epoch + 1:04d}.{fmt}"
-            plt.savefig(filename, dpi=HIGH_RES_CONFIG['dpi'], bbox_inches='tight',
-                        facecolor='white', edgecolor='none')
+            plt.savefig(f'{save_path}.{fmt}', dpi=HIGH_RES_CONFIG['dpi'],
+                        bbox_inches='tight', facecolor='white', edgecolor='none')
+        plt.close(fig)
 
-        plt.pause(0.01)
-        self.fig.canvas.draw()
+        return normality_results
 
 
+# ----------------------------------------------------------------------------
+# 4.5 Plotting utilities
+# ----------------------------------------------------------------------------
 def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
     if formats is None:
         formats = HIGH_RES_CONFIG['save_formats']
@@ -1794,6 +1405,7 @@ def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
         print(f"  Saved: {filename}")
 
     return saved_files
+
 
 def plot_losses_history(g_loss_history, d_loss_history, d_real_history, d_fake_history,
                         save_path='training_outputs/loss_plots', save_prefix="stylegan2"):
@@ -2357,10 +1969,469 @@ def initialize_models_for_training(generator, discriminator):
     print("✓ Models initialized for stable training")
 
 
-# ============================================
-# BUILD AND TRAIN
-# ============================================
+# ============================================================================
+# 5. TRAINING
+# ============================================================================
 
+# ----------------------------------------------------------------------------
+# 5.1 Callbacks
+# ----------------------------------------------------------------------------
+class ClearMemoryCallback(Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        gc.collect()
+        K.clear_session()
+
+
+class SampleSaverCallback(tf.keras.callbacks.Callback):
+    """Callback to save samples and latent space analysis."""
+
+    def __init__(self, generator, latent_dim, save_dir='training_outputs/samples',
+                 latent_analysis_interval=50):
+        super().__init__()
+        self.generator = generator
+        self.latent_dim = latent_dim
+        self.save_dir = save_dir
+        self.latent_analysis_interval = latent_analysis_interval
+        os.makedirs(save_dir, exist_ok=True)
+
+    def on_epoch_end(self, epoch, logs=None):
+        noise = np.random.normal(0, 1, (6, self.latent_dim))
+        samples = self.generator.predict(noise, verbose=0)
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle(f'Generated Samples - Epoch {epoch + 1}',
+                     fontsize=HIGH_RES_CONFIG['title_font_size'],
+                     fontweight='bold')
+
+        for i, ax in enumerate(axes.flat):
+            if i < 6:
+                im = ax.imshow(samples[i, ..., 0], cmap='viridis', aspect='auto')
+                ax.set_title(f'Sample {i + 1}', fontsize=HIGH_RES_CONFIG['font_size'],
+                             fontweight='bold')
+                ax.axis('off')
+
+        plt.tight_layout()
+
+        base_path = os.path.join(self.save_dir, f'samples_epoch_{epoch + 1:04d}')
+        plt.savefig(f"{base_path}.png", dpi=HIGH_RES_CONFIG['dpi'],
+                    bbox_inches='tight', facecolor='white', edgecolor='none')
+        plt.savefig(f"{base_path}.svg", format='svg', bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        plt.close(fig)
+
+        np.save(os.path.join(self.save_dir, f'samples_epoch_{epoch + 1:04d}.npy'), samples)
+
+        if (epoch + 1) % self.latent_analysis_interval == 0:
+            print(f"\nAnalyzing latent space gaussianity at epoch {epoch + 1}...")
+            latent_noise = np.random.normal(0, 1, (5000, self.latent_dim))
+            GaussianLatentValidator.visualize_latent_distribution(
+                latent_noise, epoch + 1,
+                save_dir='training_outputs/latent_analysis'
+            )
+            print(f"✓ Latent space analysis saved for epoch {epoch + 1}")
+
+
+class EnhancedMetricCallback(tf.keras.callbacks.Callback):
+    """Enhanced callback to compute all metrics every 10 epochs."""
+
+    def __init__(self, generator, x_test, latent_dim, metric_interval=10,
+                 log_file='training_metrics.txt', save_dir='training_outputs/metrics'):
+        super().__init__()
+        self.generator = generator
+        self.x_test = x_test
+        self.latent_dim = latent_dim
+        self.metric_interval = metric_interval
+        self.log_file = log_file
+        self.save_dir = save_dir
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        self.traditional_metrics = {
+            'FID_10k': [], 'FRD_10k': [], 'KID_10k': [], 'KRD_10k': [],
+            'FID_500': [], 'FRD_500': [], 'KID_500': [], 'KRD_500': []
+        }
+
+        self.static_metrics = {
+            'Variogram_MSE': [],
+            'Connectivity_MSE': [],
+            'Histogram_KL': [],
+            'PCA_Correlation': [],
+            'MDS_MMD': []
+        }
+
+        with open(self.log_file, 'w') as f:
+            header = "Epoch\t"
+            header += "\t".join(self.traditional_metrics.keys()) + "\t"
+            header += "\t".join(self.static_metrics.keys()) + "\n"
+            f.write(header)
+
+        self.history = {
+            'g_loss': [],
+            'd_loss': []
+        }
+
+    def on_epoch_end(self, epoch, logs=None):
+        if logs:
+            self.history['g_loss'].append(logs.get('g_loss', 0))
+            self.history['d_loss'].append(logs.get('d_loss', 0))
+
+        if (epoch + 1) % self.metric_interval == 0:
+            print(f'\n{"=" * 60}')
+            print(f'Computing ALL metrics at epoch {epoch + 1}')
+            print(f'{"=" * 60}')
+
+            size = min(500, self.x_test.shape[0])
+            noise = np.random.normal(0, 1, (size, self.latent_dim))
+            fake_data = self.generator.predict(noise, verbose=0, batch_size=16)
+            real_data = self.x_test[:size]
+
+            try:
+                traditional_results = TraditionalMetrics.compute_all_traditional_metrics(
+                    real_data, fake_data
+                )
+
+                for key in traditional_results:
+                    if abs(traditional_results[key]) > 1e6:
+                        print(f"Warning: {key} has extreme value: {traditional_results[key]:.2e}")
+                        traditional_results[key] = 100.0 if 'FID' in key or 'FRD' in key else 1.0
+            except Exception as e:
+                print(f"Error calculating traditional metrics: {e}")
+                traditional_results = {
+                    'FID_10k': 100.0, 'FID_500': 100.0,
+                    'KID_10k': 1.0, 'KID_500': 1.0,
+                    'FRD_10k': 100.0, 'FRD_500': 100.0,
+                    'KRD_10k': 1.0, 'KRD_500': 1.0
+                }
+
+            try:
+                static_results = StaticMetrics.compute_all_metrics(real_data, fake_data)
+                static_summary = {
+                    'Variogram_MSE': static_results['variogram_mse'],
+                    'Connectivity_MSE': static_results['connectivity_mse'],
+                    'Histogram_KL': static_results['hist_kl'],
+                    'PCA_Correlation': static_results['pca_correlation'],
+                    'MDS_MMD': static_results['mds_mmd']
+                }
+            except Exception as e:
+                print(f"Error calculating static metrics: {e}")
+                static_summary = {
+                    'Variogram_MSE': 1.0,
+                    'Connectivity_MSE': 1.0,
+                    'Histogram_KL': 10.0,
+                    'PCA_Correlation': 0.0,
+                    'MDS_MMD': 1.0
+                }
+
+            for key in self.traditional_metrics:
+                self.traditional_metrics[key].append(traditional_results[key])
+
+            for key in self.static_metrics:
+                self.static_metrics[key].append(static_summary[key])
+
+            self.save_metrics_to_file(epoch + 1, traditional_results, static_summary)
+            self.display_metrics(epoch + 1, traditional_results, static_summary)
+            self.save_numpy_files()
+
+            try:
+                self.plot_metrics_comparison(epoch + 1, static_results)
+            except Exception as e:
+                print(f"Error plotting metrics: {e}")
+
+    def save_metrics_to_file(self, epoch, traditional_metrics, static_metrics):
+        with open(self.log_file, 'a') as f:
+            f.write(f"{epoch}\t")
+            for key in self.traditional_metrics.keys():
+                f.write(f"{traditional_metrics[key]:.4f}\t")
+            for key in self.static_metrics.keys():
+                f.write(f"{static_metrics[key]:.4f}\t")
+            f.write("\n")
+
+    def display_metrics(self, epoch, traditional_metrics, static_metrics):
+        output = (
+            f"\nEpoch {epoch} - ALL METRICS:\n"
+            f"{'=' * 70}\n"
+            f"Traditional Metrics:\n"
+            f"  FID (10k): {traditional_metrics['FID_10k']:.4f}  "
+            f"FID (500): {traditional_metrics['FID_500']:.4f}\n"
+            f"  KID (10k): {traditional_metrics['KID_10k']:.4f}  "
+            f"KID (500): {traditional_metrics['KID_500']:.4f}\n"
+            f"  FRD (10k): {traditional_metrics['FRD_10k']:.4f}  "
+            f"FRD (500): {traditional_metrics['FRD_500']:.4f}\n"
+            f"  KRD (10k): {traditional_metrics['KRD_10k']:.4f}  "
+            f"KRD (500): {traditional_metrics['KRD_500']:.4f}\n"
+            f"{'=' * 70}\n"
+            f"Static Geostatistical Metrics:\n"
+            f"  Variogram MSE: {static_metrics['Variogram_MSE']:.6f}\n"
+            f"  Connectivity MSE: {static_metrics['Connectivity_MSE']:.6f}\n"
+            f"  Histogram KL: {static_metrics['Histogram_KL']:.6f}\n"
+            f"  PCA Correlation: {static_metrics['PCA_Correlation']:.6f}\n"
+            f"  MDS MMD: {static_metrics['MDS_MMD']:.6f}\n"
+            f"{'=' * 70}"
+        )
+        print(output)
+
+    def save_numpy_files(self):
+        for key, values in self.traditional_metrics.items():
+            np.save(f'{self.save_dir}/{key}.npy', values)
+        for key, values in self.static_metrics.items():
+            np.save(f'{self.save_dir}/{key}.npy', values)
+        np.save(f'{self.save_dir}/g_loss.npy', self.history['g_loss'])
+        np.save(f'{self.save_dir}/d_loss.npy', self.history['d_loss'])
+
+    def plot_metrics_comparison(self, epoch, static_results):
+        fig, axes = plt.subplots(2, 3, figsize=(22 * HIGH_RES_CONFIG['figsize_multiplier'],
+                                                14 * HIGH_RES_CONFIG['figsize_multiplier']),
+                                 dpi=HIGH_RES_CONFIG['dpi'])
+        fig.suptitle(f'Static Metrics Comparison - Epoch {epoch}',
+                     fontsize=HIGH_RES_CONFIG['title_font_size'] + 2,
+                     fontweight='bold')
+
+        ax = axes[0, 0]
+        lags = static_results['variogram_lags']
+        ax.plot(lags, static_results['variogram_real'], 'b-',
+                linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
+        ax.plot(lags, static_results['variogram_fake'], 'r--',
+                linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+        ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_ylabel('Variogram', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_title(f'Variogram (MSE: {static_results["variogram_mse"]:.4f})',
+                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
+        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
+
+        ax = axes[0, 1]
+        ax.plot(lags, static_results['connectivity_real'], 'b-',
+                linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
+        ax.plot(lags, static_results['connectivity_fake'], 'r--',
+                linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+        ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_ylabel('Connectivity', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_title(f'Connectivity (MSE: {static_results["connectivity_mse"]:.4f})',
+                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
+        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
+
+        ax = axes[0, 2]
+        bin_centers = (static_results['hist_bin_edges'][:-1] + static_results['hist_bin_edges'][1:]) / 2
+        bar_width = bin_centers[1] - bin_centers[0] if len(bin_centers) > 1 else 0.1
+        ax.bar(bin_centers, static_results['hist_real'], width=bar_width,
+               alpha=0.6, label='Real', color='blue', edgecolor='black', linewidth=1.0)
+        ax.plot(bin_centers, static_results['hist_fake'], 'r-',
+                linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+        ax.set_xlabel('Value', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_ylabel('Density', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_title(f'Histogram (KL: {static_results["hist_kl"]:.4f})',
+                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
+        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
+
+        ax = axes[1, 0]
+        ax.scatter(static_results['pca_real'][:, 0], static_results['pca_real'][:, 1],
+                   alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
+                   color='blue', edgecolor='black', linewidth=1.0)
+        ax.scatter(static_results['pca_fake'][:, 0], static_results['pca_fake'][:, 1],
+                   alpha=0.6, label='Generated', s=HIGH_RES_CONFIG['marker_size'],
+                   color='red', edgecolor='black', linewidth=1.0)
+        ax.set_xlabel('PC1', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_ylabel('PC2', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_title(f'PCA (Correlation: {static_results["pca_correlation"]:.4f})',
+                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
+        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
+
+        ax = axes[1, 1]
+        ax.scatter(static_results['mds_real'][:, 0], static_results['mds_real'][:, 1],
+                   alpha=0.6, label='Real', s=HIGH_RES_CONFIG['marker_size'],
+                   color='blue', edgecolor='black', linewidth=1.0)
+        ax.scatter(static_results['mds_fake'][:, 0], static_results['mds_fake'][:, 1],
+                   alpha=0.6, label='Generated', s=HIGH_RES_CONFIG['marker_size'],
+                   color='red', edgecolor='black', linewidth=1.0)
+        ax.set_xlabel('MDS Dimension 1', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_ylabel('MDS Dimension 2', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_title(f'MDS (MMD: {static_results["mds_mmd"]:.4f})',
+                     fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
+        ax.legend(fontsize=HIGH_RES_CONFIG['font_size'] - 2)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
+
+        ax = axes[1, 2]
+        summary_metrics = ['Variogram\nMSE', 'Connectivity\nMSE', 'Histogram\nKL', 'PCA\nCorrelation', 'MDS\nMMD']
+        summary_values = [
+            static_results['variogram_mse'],
+            static_results['connectivity_mse'],
+            static_results['hist_kl'],
+            static_results['pca_correlation'],
+            static_results['mds_mmd']
+        ]
+        colors = ['blue', 'green', 'orange', 'red', 'purple']
+        bars = ax.bar(summary_metrics, summary_values, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+        ax.set_ylabel('Value', fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'])
+        ax.set_title('Summary of Static Metrics', fontweight='bold', fontsize=HIGH_RES_CONFIG['title_font_size'])
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+        ax.tick_params(axis='both', which='major', labelsize=HIGH_RES_CONFIG['font_size'] - 2, width=2)
+
+        for bar, val in zip(bars, summary_values):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2., height + 0.01,
+                    f'{val:.4f}', ha='center', va='bottom', fontsize=HIGH_RES_CONFIG['font_size'] - 2,
+                    fontweight='bold')
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        base_path = f'{self.save_dir}/metrics_epoch_{epoch:04d}'
+        plt.savefig(f'{base_path}.png', dpi=HIGH_RES_CONFIG['dpi'], bbox_inches='tight')
+        plt.savefig(f'{base_path}.svg', format='svg', bbox_inches='tight')
+        plt.close(fig)
+
+
+class ImprovedStabilizationCallback(tf.keras.callbacks.Callback):
+    """Improved callback to stabilize training."""
+
+    def __init__(self, threshold_ratio=0.8):
+        super().__init__()
+        self.threshold_ratio = threshold_ratio
+        self.patience = 5
+        self.wait = 0
+        self.best_d_loss = float('inf')
+
+    def on_epoch_end(self, epoch, logs=None):
+        if logs:
+            d_loss = logs.get('d_loss', 0)
+            g_loss = logs.get('g_loss', 0)
+            d_real = logs.get('d_real', 0)
+            d_fake = logs.get('d_fake', 0)
+            grad_norm_g = logs.get('grad_norm_g', 0)
+
+            d_too_confident = (abs(d_real) > 5.0 or abs(d_fake) > 5.0)
+            loss_imbalance = (g_loss / max(d_loss, 1e-8)) > 10.0
+            grad_exploding = grad_norm_g > 100.0
+
+            if d_too_confident or loss_imbalance or grad_exploding:
+                print(f"\n STABILIZATION NEEDED at epoch {epoch + 1}:")
+
+                if d_too_confident:
+                    print(f"   Discriminator too confident: d_real={d_real:.4f}, d_fake={d_fake:.4f}")
+                    new_smoothing = min(0.3, self.model.label_smoothing * 1.5)
+                    self.model.label_smoothing = new_smoothing
+                    print(f"   Increased label smoothing to: {new_smoothing:.3f}")
+
+                if loss_imbalance:
+                    print(f"   Loss imbalance: g_loss={g_loss:.4f}, d_loss={d_loss:.4f} (ratio: {g_loss / d_loss:.2f})")
+
+                if grad_exploding:
+                    print(f"   Gradient exploding: grad_norm_g={grad_norm_g:.4f}")
+                    new_clip = max(0.1, self.model.gradient_clip * 0.5)
+                    self.model.gradient_clip = new_clip
+                    print(f"   Reduced gradient clip to: {new_clip:.3f}")
+
+            if d_loss < self.best_d_loss:
+                self.best_d_loss = d_loss
+                self.wait = 0
+            else:
+                self.wait += 1
+                if self.wait >= self.patience:
+                    current_lr_g = float(self.model.g_optimizer.learning_rate)
+                    current_lr_d = float(self.model.d_optimizer.learning_rate)
+
+                    new_lr_g = current_lr_g * 0.9
+                    new_lr_d = current_lr_d * 0.9
+
+                    self.model.g_optimizer.learning_rate.assign(new_lr_g)
+                    self.model.d_optimizer.learning_rate.assign(new_lr_d)
+
+                    print(f"\n📉 Reducing learning rates: G={new_lr_g:.6f}, D={new_lr_d:.6f}")
+                    self.wait = 0
+
+
+class AdaptiveLearningRateScheduler(tf.keras.callbacks.Callback):
+    """Adaptive learning rate scheduler based on metrics."""
+
+    def __init__(self, initial_lr_g=0.0001, initial_lr_d=0.0004):
+        super().__init__()
+        self.initial_lr_g = initial_lr_g
+        self.initial_lr_d = initial_lr_d
+        self.stable_epochs = 0
+
+    def on_epoch_end(self, epoch, logs=None):
+        if logs:
+            d_real = logs.get('d_real', 0)
+            d_fake = logs.get('d_fake', 0)
+
+            d_balance = abs(d_real + d_fake) < 0.5
+
+            if d_balance:
+                self.stable_epochs += 1
+                if self.stable_epochs >= 10:
+                    current_lr_g = float(self.model.g_optimizer.learning_rate)
+                    current_lr_d = float(self.model.d_optimizer.learning_rate)
+
+                    new_lr_g = min(self.initial_lr_g, current_lr_g * 1.1)
+                    new_lr_d = min(self.initial_lr_d, current_lr_d * 1.1)
+
+                    self.model.g_optimizer.learning_rate.assign(new_lr_g)
+                    self.model.d_optimizer.learning_rate.assign(new_lr_d)
+
+                    if new_lr_g != current_lr_g or new_lr_d != current_lr_d:
+                        print(f"\n Increasing learning rates (stable training): "
+                              f"G={new_lr_g:.6f}, D={new_lr_d:.6f}")
+
+                    self.stable_epochs = 0
+            else:
+                self.stable_epochs = 0
+
+
+class LivePlotCallback(keras.callbacks.Callback):
+    def __init__(self, model, data, num_images=10):
+        super().__init__()
+        self.model = model
+        self.data = data
+        self.num_images = num_images
+
+        self.fig_width = num_images * 4 * HIGH_RES_CONFIG['figsize_multiplier']
+        self.fig_height = 4 * HIGH_RES_CONFIG['figsize_multiplier']
+
+        self.fig, self.ax = plt.subplots(1, num_images * 2,
+                                         figsize=(self.fig_width, self.fig_height),
+                                         dpi=HIGH_RES_CONFIG['dpi'])
+
+        plt.ion()
+
+    def on_epoch_end(self, epoch, logs=None):
+        indices = np.random.randint(0, self.data.shape[0], self.num_images)
+        original_imgs = self.data[indices]
+
+        noise = np.random.normal(0, 1, (self.num_images, latent_dim))
+        generated_imgs = self.model.generator.predict(noise, verbose=0)
+
+        for i in range(self.num_images):
+            self.ax[i * 2].imshow(original_imgs[i].squeeze(), cmap='viridis', interpolation='nearest', vmin=-1, vmax=1)
+            self.ax[i * 2].set_title("Original", fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'] - 12)
+            self.ax[i * 2].axis('off')
+
+            self.ax[i * 2 + 1].imshow(generated_imgs[i].squeeze(), cmap='viridis', interpolation='nearest', vmin=-1,
+                                      vmax=1)
+            self.ax[i * 2 + 1].set_title(f"Generated", fontweight='bold', fontsize=HIGH_RES_CONFIG['font_size'] - 12)
+            self.ax[i * 2 + 1].axis('off')
+
+        self.fig.suptitle(f'Epoch {epoch + 1}: Original vs Generated Samples',
+                          fontsize=HIGH_RES_CONFIG['title_font_size'] - 8, fontweight='bold')
+
+        for fmt in HIGH_RES_CONFIG['save_formats']:
+            filename = f"training_outputs/training_live_epoch_{epoch + 1:04d}.{fmt}"
+            plt.savefig(filename, dpi=HIGH_RES_CONFIG['dpi'], bbox_inches='tight',
+                        facecolor='white', edgecolor='none')
+
+        plt.pause(0.01)
+        self.fig.canvas.draw()
+
+
+# ----------------------------------------------------------------------------
+# 5.2 Build and train
+# ----------------------------------------------------------------------------
 print("\n" + "=" * 60)
 print("BUILDING STYLEGAN2 WITH W-SPACE SUPPORT")
 print("=" * 60)
@@ -2397,7 +2468,6 @@ try:
 except Exception as e:
     print(f"✗ Generator error: {e}")
     import traceback
-
     traceback.print_exc()
 
 print("\nBuilding Feature Extracting Discriminator...")
@@ -2413,7 +2483,6 @@ try:
 except Exception as e:
     print(f"✗ Discriminator error: {e}")
     import traceback
-
     traceback.print_exc()
 
 print(f"\nGenerator parameters: {generator.count_params():,}")
@@ -2484,231 +2553,163 @@ early_stopping = tf.keras.callbacks.EarlyStopping(
     mode='min',
 )
 
-checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
-    filepath='training_outputs/checkpoints/stylegan2_epoch_{epoch:03d}.weights_w.h5',
-    monitor='d_loss',
-    save_weights_only=True,
-    save_best_only=True,
+checkpoint = tf.keras.callbacks.ModelCheckpoint(
+    filepath='training_outputs/best_generator.weights_w.h5',
+    monitor='g_loss',
     mode='min',
-    verbose=1,
-    save_freq='epoch'
+    save_best_only=True,
+    save_weights_only=True,
+    verbose=1
 )
 
-print("Creating output directories...")
-os.makedirs('training_outputs/samples', exist_ok=True)
-os.makedirs('training_outputs/metrics', exist_ok=True)
-os.makedirs('training_outputs/checkpoints', exist_ok=True)
-os.makedirs('training_outputs/loss_plots', exist_ok=True)
-os.makedirs('training_outputs/final_outputs', exist_ok=True)
-os.makedirs('training_outputs/latent_analysis', exist_ok=True)
+callbacks = [
+    live_plot_callback,
+    sample_saver_callback,
+    enhanced_metric_callback,
+    improved_stabilization_callback,
+    adaptive_lr_scheduler,
+    early_stopping,
+    checkpoint,
+]
 
-print("\nInitializing models with stable weights...")
-initialize_models_for_training(generator, discriminator)
-
-print("Preparing training dataset...")
-
-train_dataset = tf.data.Dataset.from_tensor_slices(x_train)
-train_dataset = train_dataset.shuffle(buffer_size=10000)
-train_dataset = train_dataset.batch(batch_size, drop_remainder=True)
-train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
-
-print(f"\n{'=' * 60}")
-print("STARTING STYLEGAN2 TRAINING WITH W-SPACE SUPPORT")
-print("=" * 60)
-print(f"Dataset: {name}")
-print(f"Training samples: {len(x_train)}")
-print(f"Test samples: {len(x_test)}")
-print(f"Image shape: {ni}x{nj}x{nz}")
-print(f"Z dimension: {latent_dim}")
-print(f"W dimension: {w_dim}")
-print(f"Batch size: {batch_size}")
-print(f"Learning rates: G=0.0001, D=0.0004")
-print(f"FID/FRD: 10 batches x 1000 samples (10000 total)")
+print("\n" + "=" * 60)
+print("STARTING TRAINING")
 print("=" * 60)
 
-try:
-    print("\nFinal test before training...")
-    test_noise = tf.random.normal([2, latent_dim])
-    test_output = generator(test_noise, training=False)
-    print(f"✓ Generator test passed! Output shape: {test_output.shape}")
+train_dataset = tf.data.Dataset.from_tensor_slices(x_train.astype('float32')).shuffle(10000).batch(batch_size)
 
-    test_disc_output = discriminator(test_output, training=False)
-    print(f"✓ Discriminator test passed! Output shape: {test_disc_output.shape}")
+history = stylegan2.fit(
+    train_dataset,
+    epochs=epochs,
+    callbacks=callbacks,
+    verbose=1
+)
 
-    print("\nStarting training...")
+plt.ioff()
+plt.close('all')
 
-    history = stylegan2.fit(
-        train_dataset,
-        epochs=epochs,
-        callbacks=[
-            sample_saver_callback,
-            enhanced_metric_callback,
-            improved_stabilization_callback,
-            adaptive_lr_scheduler,
-            live_plot_callback,
-            early_stopping,
-            checkpoint_callback
-        ],
-        verbose=1
+end_time = time.time()
+execution_time = end_time - start_time
+
+print(f"\n[INFO] Training completed in {execution_time / 3600:.2f} hours")
+
+
+# ============================================================================
+# 6. EVALUATION & PLOTS
+# ============================================================================
+
+print("\n" + "=" * 60)
+print("FINAL EVALUATION AND PLOTS")
+print("=" * 60)
+
+# Final distribution / latent space plot
+plot_original_distribution_and_latent_space(
+    original_data=x_test,
+    generator_model=generator,
+    latent_dim=latent_dim,
+    save_path='training_outputs/final_outputs'
+)
+
+# Final sample vs generated distributions
+sample_noise = np.random.normal(0, 1, (5, latent_dim))
+final_samples = generator.predict(sample_noise, verbose=0)
+plot_histograms_and_densities(
+    original=x_test[:5],
+    generated=final_samples,
+    latent_vectors=None,
+    epoch=None
+)
+
+# Final static metrics comparison
+final_static_metrics = plot_static_metrics_comparison(
+    real_data=x_test,
+    generator_model=generator,
+    save_path_base='training_outputs/final_outputs/static_metrics_comparison'
+)
+
+# Final traditional metrics
+print("\nComputing final traditional metrics...")
+final_sample_size = min(500, len(x_test))
+final_noise = np.random.normal(0, 1, (final_sample_size, latent_dim))
+final_fake_data = generator.predict(final_noise, verbose=0)
+final_traditional = TraditionalMetrics.compute_all_traditional_metrics(
+    x_test[:final_sample_size], final_fake_data
+)
+print("\nFinal Traditional Metrics:")
+for k, v in final_traditional.items():
+    print(f"  {k}: {v:.4f}")
+
+# Latent space normality analysis
+print("\nAnalyzing latent space gaussianity...")
+latent_noise = np.random.normal(0, 1, (5000, latent_dim))
+final_latent_analysis = GaussianLatentValidator.visualize_latent_distribution(
+    latent_noise, epoch=epochs,
+    save_dir='training_outputs/latent_analysis'
+)
+final_latent_kl = GaussianLatentValidator.kl_divergence_gaussian(latent_noise)
+
+# Loss plots from history
+g_loss_history = history.history.get('g_loss', [])
+d_loss_history = history.history.get('d_loss', [])
+d_real_history = history.history.get('d_real', [])
+d_fake_history = history.history.get('d_fake', [])
+
+if len(g_loss_history) > 0:
+    print("\nSaving loss plots...")
+    plot_losses_history(
+        g_loss_history, d_loss_history, d_real_history, d_fake_history,
+        save_path='training_outputs/loss_plots', save_prefix="stylegan2"
     )
 
-    g_loss_history = history.history['g_loss']
-    d_loss_history = history.history['d_loss']
-    d_real_history = history.history['d_real']
-    d_fake_history = history.history['d_fake']
 
-    plot_losses_history(g_loss_history, d_loss_history, d_real_history, d_fake_history)
+# ============================================================================
+# 7. SAVING
+# ============================================================================
 
-    print("\n✓ Training completed successfully!")
+# ----------------------------------------------------------------------------
+# 7.1 Save all model weights
+# ----------------------------------------------------------------------------
+stylegan2.save_all_models_weights(save_dir='training_outputs/final_models')
 
+# ----------------------------------------------------------------------------
+# 7.2 Save final report
+# ----------------------------------------------------------------------------
+all_metrics = {
+    'training_history': {
+        'g_loss': g_loss_history,
+        'd_loss': d_loss_history,
+        'd_real': d_real_history,
+        'd_fake': d_fake_history,
+    },
+    'traditional': final_traditional,
+    'static': {
+        'variogram_mse': final_static_metrics['variogram_mse'],
+        'connectivity_mse': final_static_metrics['connectivity_mse'],
+        'hist_kl': final_static_metrics['hist_kl'],
+        'pca_correlation': final_static_metrics['pca_correlation'],
+        'mds_mmd': final_static_metrics['mds_mmd'],
+    },
+    'latent_analysis': final_latent_analysis,
+    'latent_kl_divergence': final_latent_kl,
+}
 
-    stylegan2.save_all_models_weights('training_outputs/final_models')
+final_report_path = generate_final_report(
+    all_metrics=all_metrics,
+    execution_time=execution_time,
+    save_path='training_outputs/FINAL_REPORT.txt'
+)
 
-    print(f"\n{'=' * 60}")
-    print("PERFORMING FINAL ANALYSIS")
-    print("=" * 60)
-
-    print("Generating final samples...")
-    size = min(10000, len(x_test))
-    noise = np.random.normal(0, 1, (size, latent_dim))
-    fake_data = generator.predict(noise, verbose=0, batch_size=32)
-    real_data = x_test[:size]
-
-    print("\nCalculating final traditional metrics...")
-    final_traditional_metrics = TraditionalMetrics.compute_all_traditional_metrics(
-        real_data, fake_data
-    )
-
-    print("\nCalculating final static metrics...")
-    final_static_metrics = StaticMetrics.compute_all_metrics(real_data, fake_data)
-
-    print("\nAnalyzing final latent space...")
-    final_latent_noise = np.random.normal(0, 1, (10000, latent_dim))
-    final_latent_analysis = GaussianLatentValidator.test_normality(final_latent_noise)
-    final_latent_kl = GaussianLatentValidator.kl_divergence_gaussian(final_latent_noise)
-    GaussianLatentValidator.visualize_latent_distribution(
-        final_latent_noise,
-        len(g_loss_history),
-        save_dir='training_outputs/latent_analysis'
-    )
-
-    # Consolidate metrics
-    final_metrics = {
-        'traditional': final_traditional_metrics,
-        'static': final_static_metrics,
-        'latent_analysis': final_latent_analysis,
-        'latent_kl_divergence': final_latent_kl,
-        'training_history': {
-            'g_loss': g_loss_history,
-            'd_loss': d_loss_history,
-            'd_real': d_real_history,
-            'd_fake': d_fake_history,
-            'total_epochs': len(g_loss_history)
-        }
-    }
-
-    np.save('training_outputs/metrics/final_metrics.npy', final_metrics)
-
-    print("\nGenerating final visualizations...")
-
-
-    noise = np.random.normal(0, 1, (6, latent_dim))
-    final_samples = generator.predict(noise, verbose=0)
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle('Final Generated Samples - StyleGAN2 (W-Space)',
-                 fontsize=HIGH_RES_CONFIG['title_font_size'] + 2,
-                 fontweight='bold')
-
-    for i, ax in enumerate(axes.flat):
-        if i < 6:
-            im = ax.imshow(final_samples[i, ..., 0], cmap='viridis', aspect='auto')
-            ax.set_title(f'Sample {i + 1}', fontsize=HIGH_RES_CONFIG['font_size'], fontweight='bold')
-            ax.axis('off')
-
-    plt.tight_layout()
-
-    final_samples_path = 'training_outputs/final_outputs/final_samples_grid'
-    plt.savefig(f'{final_samples_path}.png', dpi=HIGH_RES_CONFIG['dpi'], bbox_inches='tight')
-    plt.savefig(f'{final_samples_path}.svg', format='svg', bbox_inches='tight')
-    plt.close(fig)
-
-    np.save('training_outputs/final_outputs/final_samples.npy', final_samples)
-
-    plot_histograms_and_densities(real_data[:5], fake_data[:5], latent_vectors=final_latent_noise)
-
-    plot_static_metrics_comparison(
-        x_test, generator,
-        save_path_base='training_outputs/final_outputs/final_static_metrics'
-    )
-
-    plot_original_distribution_and_latent_space(
-        original_data=x_test,
-        generator_model=generator,
-        latent_dim=latent_dim,
-        save_path='training_outputs/final_outputs'
-    )
-
-    end_time = time.time()
-    execution_time = end_time - start_time
-
-    generate_final_report(final_metrics, execution_time, 'training_outputs/FINAL_REPORT.txt')
-
-    print(f"\n{'=' * 60}")
-    print("STYLEGAN2 TRAINING WITH W-SPACE COMPLETED SUCCESSFULLY")
-    print("=" * 60)
-    print(f"Total execution time: {execution_time / 3600:.2f} hours")
-    print(f"W dimension ({w_dim}) has been saved for data assimilation")
-    print(f"Final report saved to: training_outputs/FINAL_REPORT.txt")
-    print(f"Final model weights saved in: training_outputs/final_models/")
-    print(f"  - generator.weights_w.h5")
-    print(f"  - discriminator.weights_w.h5")
-    print(f"  - stylegan2_complete.weights_w.h5")
-    print(f"  - w_dim.txt")
-    print("=" * 60)
-
-    print("\nFINAL METRICS SUMMARY:")
-    print("-" * 40)
-    print("Traditional Metrics:")
-    for key, value in final_traditional_metrics.items():
-        print(f"  {key}: {value:.4f}")
-
-    print("\nStatic Geostatistical Metrics:")
-    print(f"  Variogram MSE: {final_static_metrics['variogram_mse']:.6f}")
-    print(f"  Connectivity MSE: {final_static_metrics['connectivity_mse']:.6f}")
-    print(f"  Histogram KL Divergence: {final_static_metrics['hist_kl']:.6f}")
-    print(f"  PCA Correlation: {final_static_metrics['pca_correlation']:.6f}")
-    print(f"  MDS MMD: {final_static_metrics['mds_mmd']:.6f}")
-
-    print("\nW-Space Information:")
-    print(f"  W dimension: {w_dim}")
-    print(f"  The W space is ready for data assimilation")
-    print("=" * 60)
-
-except Exception as e:
-    print(f"\n✗ Training failed with error: {e}")
-    import traceback
-
-    traceback.print_exc()
-
-    try:
-        if 'g_loss_history' in locals() and g_loss_history:
-            plot_losses_history(g_loss_history, d_loss_history, d_real_history, d_fake_history)
-            print("✓ Loss plots saved despite error.")
-
-        if 'stylegan2' in locals():
-            print("\nAttempting to save models despite error...")
-            stylegan2.save_all_models_weights('training_outputs/emergency_save')
-    except:
-        print("Could not save models.")
-
-finally:
-    print("\nCleaning up memory...")
-    plt.ioff()
-    plt.close('all')
-    tf.keras.backend.clear_session()
-    gc.collect()
-
-    print("\n" + "=" * 60)
-    print("PROGRAM EXECUTION COMPLETED")
-    print("=" * 60)
+# ----------------------------------------------------------------------------
+# 7.3 Final summary
+# ----------------------------------------------------------------------------
+print("\n" + "=" * 60)
+print("TRAINING COMPLETED SUCCESSFULLY")
+print("=" * 60)
+print(f"Execution time: {execution_time / 3600:.2f} hours")
+if len(g_loss_history) > 0:
+    print(f"Total epochs trained: {len(g_loss_history)}")
+    print(f"Final Generator Loss: {g_loss_history[-1]:.4f}")
+    print(f"Final Discriminator Loss: {d_loss_history[-1]:.4f}")
+print("=" * 60)
+print(f"\nFinal report saved to: {final_report_path}")
+print("=" * 60)
