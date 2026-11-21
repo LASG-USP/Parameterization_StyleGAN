@@ -1,15 +1,3 @@
-# ============================================================================
-# VAE-GAN FOR GEOSTATISTICAL FACIES MODELING
-# ============================================================================
-#   1. IMPORTS & CONFIGURATION
-#   2. DATA LOADING & PREPROCESSING
-#   3. MODEL ARCHITECTURE
-#   4. METRICS & UTILITIES
-#   5. TRAINING
-#   6. EVALUATION & PLOTS
-#   7. SAVING
-# ============================================================================
-
 
 # ============================================================================
 # 1. IMPORTS & CONFIGURATION
