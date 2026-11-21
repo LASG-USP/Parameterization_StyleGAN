@@ -1,75 +1,47 @@
+# ============================================================================
+# 1. IMPORTS & CONFIGURATION
+# ============================================================================
+
 import os
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
+import gc
+import time
+import pickle
+import warnings
+import glob
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
+import psutil
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
-import matplotlib.pyplot as plt
+from tensorflow.keras import layers, backend as K
 from tensorflow.keras.layers import LeakyReLU, BatchNormalization
 from tensorflow.keras.models import load_model
 from tensorflow.keras import Model
 from tensorflow.keras.applications.inception_v3 import InceptionV3
-from scipy.stats import gaussian_kde
+from tensorflow.keras.callbacks import Callback
+
+from scipy.stats import gaussian_kde, entropy
 from scipy.spatial.distance import pdist, squareform
 from scipy.linalg import sqrtm
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS
-import time
-import seaborn as sns
-import pandas as pd
-import pickle
-import psutil
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
-from scipy.stats import entropy
 from sklearn.metrics import pairwise_kernels
 from sklearn.impute import SimpleImputer
-import warnings
-import glob
-from datetime import datetime
-import gc
-from tensorflow.keras import backend as K
-from tensorflow.keras.callbacks import Callback
+
 from metrics import *
 
-class ClearMemoryCallback(Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        gc.collect()
-        K.clear_session()
 
-
-warnings.filterwarnings('ignore')
-
-plt.rcParams.update({
-    'font.size': 20,
-    'axes.titlesize': 24,
-    'axes.labelsize': 22,
-    'xtick.labelsize': 18,
-    'ytick.labelsize': 18,
-    'legend.fontsize': 18,
-    'figure.titlesize': 26,
-    'figure.dpi': 100,
-    'savefig.dpi': 300,
-    'font.family': 'sans-serif',
-})
-
-tf.keras.backend.clear_session()
-gc.collect()
-
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"Available GPUs: {len(gpus)}")
-    except RuntimeError as e:
-        print(e)
-
-# ==============================================
-# Configuration — CONTINUOUS CASE (unisim_ii_cropped)
-# ==============================================
+# ----------------------------------------------------------------------------
+# Global configuration — CONTINUOUS CASE (unisim_ii_cropped)
+# ----------------------------------------------------------------------------
 zdim = 512
 epochs = 150
 batch_size = 64
@@ -113,9 +85,43 @@ HIGH_RES_CONFIG = {
     'save_formats': ['png', 'svg']
 }
 
-# ==============================================
-# Load dataset
-# ==============================================
+# ----------------------------------------------------------------------------
+# Environment setup
+# ----------------------------------------------------------------------------
+warnings.filterwarnings('ignore')
+
+plt.rcParams.update({
+    'font.size': 20,
+    'axes.titlesize': 24,
+    'axes.labelsize': 22,
+    'xtick.labelsize': 18,
+    'ytick.labelsize': 18,
+    'legend.fontsize': 18,
+    'figure.titlesize': 26,
+    'figure.dpi': 100,
+    'savefig.dpi': 300,
+    'font.family': 'sans-serif',
+})
+
+tf.keras.backend.clear_session()
+gc.collect()
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"Available GPUs: {len(gpus)}")
+    except RuntimeError as e:
+        print(e)
+
+os.makedirs('training_outputs', exist_ok=True)
+
+
+# ============================================================================
+# 2. DATA LOADING & PREPROCESSING
+# ============================================================================
+
 # We store min/max BEFORE the min-max so we can save the normalization.
 X_train_min_val = None
 X_train_max_val = None
@@ -194,115 +200,359 @@ print(f"Encoder: VAE (dual head: z_mean, z_log_var)")
 print(f"{'=' * 60}\n")
 
 
-# ==============================================
-# STABLE FID / KID
-# ==============================================
+# ============================================================================
+# 3. MODEL ARCHITECTURE
+# ============================================================================
 
-def frechet_distance_stable(act_real, act_gen, eps=FID_EPS):
-    mu_r = np.mean(act_real, axis=0)
-    mu_g = np.mean(act_gen, axis=0)
-    sigma_r = np.cov(act_real, rowvar=False)
-    sigma_g = np.cov(act_gen, rowvar=False)
-    sigma_r = np.atleast_2d(sigma_r)
-    sigma_g = np.atleast_2d(sigma_g)
-    sigma_r = sigma_r + np.eye(sigma_r.shape[0]) * eps
-    sigma_g = sigma_g + np.eye(sigma_g.shape[0]) * eps
-    diff = mu_r - mu_g
-    mean_diff = float(np.dot(diff, diff))
-    covmean = sqrtm(sigma_r @ sigma_g)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    trace_term = float(np.trace(sigma_r + sigma_g - 2.0 * covmean))
-    fid = mean_diff + trace_term
-    if not np.isfinite(fid):
-        return 1e12
-    return max(fid, 0.0)
-
-
-def frechet_distance_batched(real_features, fake_features,
-                              n_batches=10, batch_size=1000, eps=FID_EPS):
-    """
-    Computes the Frechet Distance using batched computation over 10 batches of 1000 samples.
-    Accumulates the statistics (mean and covariance) incrementally between batches,
-    without keeping all features at once to compute the statistics.
-    """
-    real_features = np.asarray(real_features, dtype=np.float64)
-    fake_features = np.asarray(fake_features, dtype=np.float64)
-
-    real_features = np.nan_to_num(real_features, nan=0.0, posinf=0.0, neginf=0.0)
-    fake_features = np.nan_to_num(fake_features, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Accumulate statistics for the real features
-    real_sum = np.zeros(real_features.shape[1], dtype=np.float64)
-    real_sum_sq = np.zeros((real_features.shape[1], real_features.shape[1]), dtype=np.float64)
-    real_count = 0
-
-    for i in range(n_batches):
-        start = i * batch_size
-        end = start + batch_size
-        batch = real_features[start:end]
-        if batch.shape[0] == 0:
-            continue
-        real_sum += batch.sum(axis=0)
-        real_sum_sq += batch.T @ batch
-        real_count += batch.shape[0]
-
-    mu_r = real_sum / real_count
-    sigma_r = (real_sum_sq / real_count) - np.outer(mu_r, mu_r)
-
-    # Accumulate statistics for the generated features
-    fake_sum = np.zeros(fake_features.shape[1], dtype=np.float64)
-    fake_sum_sq = np.zeros((fake_features.shape[1], fake_features.shape[1]), dtype=np.float64)
-    fake_count = 0
-
-    for i in range(n_batches):
-        start = i * batch_size
-        end = start + batch_size
-        batch = fake_features[start:end]
-        if batch.shape[0] == 0:
-            continue
-        fake_sum += batch.sum(axis=0)
-        fake_sum_sq += batch.T @ batch
-        fake_count += batch.shape[0]
-
-    mu_g = fake_sum / fake_count
-    sigma_g = (fake_sum_sq / fake_count) - np.outer(mu_g, mu_g)
-
-    sigma_r = np.atleast_2d(sigma_r)
-    sigma_g = np.atleast_2d(sigma_g)
-    sigma_r = sigma_r + np.eye(sigma_r.shape[0]) * eps
-    sigma_g = sigma_g + np.eye(sigma_g.shape[0]) * eps
-
-    diff = mu_r - mu_g
-    mean_diff = float(np.dot(diff, diff))
-    covmean = sqrtm(sigma_r @ sigma_g)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    trace_term = float(np.trace(sigma_r + sigma_g - 2.0 * covmean))
-    fid = mean_diff + trace_term
-    if not np.isfinite(fid):
-        return 1e12
-    return max(fid, 0.0)
+# ----------------------------------------------------------------------------
+# 3.1 VAE Encoder
+# ----------------------------------------------------------------------------
+def build_vae_encoder(input_shape, latent_dim):
+    inputs = keras.Input(shape=input_shape, dtype=tf.float32)
+    x = layers.Conv2D(32, 3, strides=2, padding="same", dtype=tf.float32)(inputs)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2D(64, 3, strides=2, padding="same", dtype=tf.float32)(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2D(128, 3, strides=2, padding="same", dtype=tf.float32)(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2D(256, 3, strides=2, padding="same", dtype=tf.float32)(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Dropout(0.4)(x)
+    x = layers.Flatten()(x)
+    x = layers.Dense(256, dtype=tf.float32)(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Dropout(0.3)(x)
+    z_mean = layers.Dense(latent_dim, name="z_mean", dtype=tf.float32)(x)
+    z_log_var = layers.Dense(latent_dim, name="z_log_var", dtype=tf.float32)(x)
+    return keras.Model(inputs, [z_mean, z_log_var], name="vae_encoder")
 
 
-def kernel_distance_stable(act_real, act_gen, num_blocks=50, max_block_size=500):
-    n = min(len(act_real), len(act_gen), max_block_size)
-    x = act_real[:n]
-    y = act_gen[:n]
-    d = x.shape[1]
-    k = 3
-    coef = 1.0 / d
-
-    def poly_kernel(a, b):
-        return (a @ b.T / d + coef) ** k
-
-    k_xx = poly_kernel(x, x).mean()
-    k_yy = poly_kernel(y, y).mean()
-    k_xy = poly_kernel(x, y).mean()
-    mmd2 = k_xx + k_yy - 2 * k_xy
-    return max(float(mmd2), 0.0)
+encoder = build_vae_encoder((ni, nj, nz), latent_dim)
 
 
+# ----------------------------------------------------------------------------
+# 3.2 Continuous Decoder (tanh output)
+# ----------------------------------------------------------------------------
+def build_decoder(latent_dim, output_shape):
+    latent_inputs = keras.Input(shape=(latent_dim,), dtype=tf.float32)
+    x = layers.Dense(6 * 6 * 256, dtype=tf.float32)(latent_inputs)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.Dropout(0.2)(x)
+    x = layers.Reshape((6, 6, 256))(x)
+    x = layers.Conv2DTranspose(128, 3, strides=2, padding="same", dtype=tf.float32)(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2DTranspose(64, 3, strides=2, padding="same", dtype=tf.float32)(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    x = layers.Conv2DTranspose(32, 3, strides=2, padding="same", dtype=tf.float32)(x)
+    x = LeakyReLU(alpha=0.2)(x)
+    x = layers.BatchNormalization(dtype=tf.float32)(x)
+    outputs = layers.Conv2D(output_shape[-1], 3, activation="tanh", padding="same", dtype=tf.float32)(x)
+    return keras.Model(latent_inputs, outputs, name="decoder")
+
+
+decoder = build_decoder(latent_dim, (ni, nj, nz))
+
+
+# ----------------------------------------------------------------------------
+# 3.3 Real 1D UNet Denoiser
+# ----------------------------------------------------------------------------
+def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
+    assert latent_dim % 8 == 0, \
+        f"latent_dim must be divisible by 8 for 3 pooling levels (got {latent_dim})"
+
+    def sinusoidal_embedding(x):
+        half_dim = time_emb_dim // 2
+        emb = tf.math.log(10000.0) / (half_dim - 1)
+        emb = tf.exp(tf.range(half_dim, dtype=tf.float32) * -emb)
+        x = tf.cast(x, tf.float32)
+        emb = x * emb
+        return tf.concat([tf.sin(emb), tf.cos(emb)], axis=1)
+
+    def time_mlp(t_emb):
+        x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_1")(t_emb)
+        x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_2")(x)
+        return x
+
+    def res_block(x, t_emb, filters, name):
+        h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv1")(x)
+        h = layers.LayerNormalization(name=f"{name}_ln1")(h)
+        h = layers.Activation("swish", name=f"{name}_act1")(h)
+        t = layers.Dense(filters, name=f"{name}_tproj")(t_emb)
+        t = layers.Reshape((1, filters), name=f"{name}_treshape")(t)
+        h = layers.Add(name=f"{name}_tadd")([h, t])
+        h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv2")(h)
+        h = layers.LayerNormalization(name=f"{name}_ln2")(h)
+        if x.shape[-1] != filters:
+            x = layers.Conv1D(filters, 1, padding="same", name=f"{name}_skip_proj")(x)
+        out = layers.Add(name=f"{name}_resadd")([x, h])
+        return layers.Activation("swish", name=f"{name}_out")(out)
+
+    def downsample(x, filters, name):
+        return layers.Conv1D(filters, 4, strides=2, padding="same", name=f"{name}_down")(x)
+
+    def upsample_with_skip(x, skip, filters, name):
+        x = layers.UpSampling1D(size=2, name=f"{name}_up")(x)
+        assert x.shape[1] == skip.shape[1]
+        x = layers.Concatenate(name=f"{name}_concat")([x, skip])
+        x = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv")(x)
+        x = layers.LayerNormalization(name=f"{name}_ln")(x)
+        return layers.Activation("swish", name=f"{name}_act")(x)
+
+    latent_input = keras.Input(shape=(latent_dim,), dtype=tf.float32, name="latent_input")
+    time_input = keras.Input(shape=(1,), dtype=tf.float32, name="time_input")
+
+    t_emb = sinusoidal_embedding(time_input)
+    t_emb = time_mlp(t_emb)
+
+    x = layers.Reshape((latent_dim, 1), name="reshape_input")(latent_input)
+    x = layers.Conv1D(base_filters, 3, padding="same", name="input_conv")(x)
+
+    e0 = res_block(x, t_emb, base_filters, "enc0")
+    d1 = downsample(e0, base_filters * 2, "enc1_down")
+    e1 = res_block(d1, t_emb, base_filters * 2, "enc1")
+    d2 = downsample(e1, base_filters * 4, "enc2_down")
+    e2 = res_block(d2, t_emb, base_filters * 4, "enc2")
+    d3 = downsample(e2, base_filters * 8, "enc3_down")
+    e3 = res_block(d3, t_emb, base_filters * 8, "enc3")
+
+    b = res_block(e3, t_emb, base_filters * 8, "bottleneck_1")
+    b = res_block(b, t_emb, base_filters * 8, "bottleneck_2")
+
+    u3 = upsample_with_skip(b, e2, base_filters * 4, "dec3")
+    u3 = res_block(u3, t_emb, base_filters * 4, "dec3_res")
+    u2 = upsample_with_skip(u3, e1, base_filters * 2, "dec2")
+    u2 = res_block(u2, t_emb, base_filters * 2, "dec2_res")
+    u1 = upsample_with_skip(u2, e0, base_filters, "dec1")
+    u1 = res_block(u1, t_emb, base_filters, "dec1_res")
+
+    out = layers.Conv1D(base_filters, 3, padding="same", name="out_conv1")(u1)
+    out = layers.Activation("swish", name="out_act")(out)
+    out = layers.Conv1D(1, 3, padding="same", name="out_conv2")(out)
+    out = layers.Reshape((latent_dim,), name="output_reshape")(out)
+
+    return keras.Model([latent_input, time_input], out, name="unet_1d")
+
+
+unet = build_unet_model(latent_dim, time_emb_dim=256, base_filters=64)
+
+
+# ----------------------------------------------------------------------------
+# 3.4 Diffusion Model (composite)
+# ----------------------------------------------------------------------------
+class DiffusionModel(keras.Model):
+    def __init__(self, encoder, decoder, unet, num_timesteps=500,
+                 beta_start=0.0001, beta_end=0.04, kl_weight=0.0001, **kwargs):
+        super().__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.unet = unet
+        self.num_timesteps = num_timesteps
+        # tf.Variable to allow runtime adjustment without re-tracing the graph
+        self.kl_weight = tf.Variable(float(kl_weight), trainable=False,
+                                     dtype=tf.float32, name="kl_weight")
+
+        self.betas = tf.cast(tf.linspace(beta_start, beta_end, num_timesteps), tf.float32)
+        self.alphas = 1. - self.betas
+        self.alphas_cumprod = tf.math.cumprod(self.alphas, axis=0)
+        self.sqrt_alphas_cumprod = tf.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = tf.sqrt(1. - self.alphas_cumprod)
+        self.sqrt_recip_alphas = tf.sqrt(1.0 / self.alphas)
+        alphas_cumprod_prev = tf.concat([[1.0], self.alphas_cumprod[:-1]], axis=0)
+        self.posterior_variance = self.betas * (1. - alphas_cumprod_prev) / (1. - self.alphas_cumprod)
+
+        self.total_loss_tracker = keras.metrics.Mean(name="total_loss", dtype=tf.float32)
+        self.diffusion_loss_tracker = keras.metrics.Mean(name="diffusion_loss", dtype=tf.float32)
+        self.reconstruction_loss_tracker = keras.metrics.Mean(name="reconstruction_loss", dtype=tf.float32)
+        self.kl_loss_tracker = keras.metrics.Mean(name="kl_loss", dtype=tf.float32)
+
+    @property
+    def metrics(self):
+        return [self.total_loss_tracker, self.diffusion_loss_tracker,
+                self.reconstruction_loss_tracker, self.kl_loss_tracker]
+
+    def compile(self, **kwargs):
+        super().compile(**kwargs)
+        self.optimizer = keras.optimizers.Adam(learning_rate=initial_lr, beta_1=0.5, clipnorm=1.0)
+
+    def reparameterize(self, z_mean, z_log_var):
+        eps = tf.random.normal(shape=tf.shape(z_mean), dtype=tf.float32)
+        return z_mean + tf.exp(0.5 * z_log_var) * eps
+
+    def compute_kl_loss(self, z_mean, z_log_var):
+        kl = -0.5 * tf.reduce_sum(1.0 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=-1)
+        return tf.reduce_mean(kl)
+
+    def sample_timesteps(self, batch_size):
+        return tf.random.uniform(shape=(batch_size,), minval=0,
+                                 maxval=self.num_timesteps, dtype=tf.int32)
+
+    def q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = tf.random.normal(tf.shape(x_start), dtype=tf.float32)
+        a = tf.gather(self.sqrt_alphas_cumprod, t)
+        b = tf.gather(self.sqrt_one_minus_alphas_cumprod, t)
+        a = tf.reshape(a, [-1] + [1] * (len(x_start.shape) - 1))
+        b = tf.reshape(b, [-1] + [1] * (len(x_start.shape) - 1))
+        return a * x_start + b * noise
+
+    def p_sample(self, x, t, t_index):
+        betas_t = tf.gather(self.betas, t)
+        sqrt_one_minus = tf.gather(self.sqrt_one_minus_alphas_cumprod, t)
+        sqrt_recip = tf.gather(self.sqrt_recip_alphas, t)
+        betas_t = tf.reshape(betas_t, [-1] + [1] * (len(x.shape) - 1))
+        sqrt_one_minus = tf.reshape(sqrt_one_minus, [-1] + [1] * (len(x.shape) - 1))
+        sqrt_recip = tf.reshape(sqrt_recip, [-1] + [1] * (len(x.shape) - 1))
+        t_batch = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
+        model_output = self.unet([x, t_batch], training=False)
+        model_mean = sqrt_recip * (x - betas_t * model_output / sqrt_one_minus)
+        if t_index == 0:
+            return model_mean
+        posterior_variance_t = tf.gather(self.posterior_variance, t)
+        posterior_variance_t = tf.reshape(posterior_variance_t, [-1] + [1] * (len(x.shape) - 1))
+        noise = tf.random.normal(shape=tf.shape(x), dtype=tf.float32)
+        return model_mean + tf.sqrt(posterior_variance_t) * noise
+
+    def sample(self, num_samples, training=False, verbose=True, chunk_size=SAMPLE_CHUNK_SIZE):
+        if verbose:
+            print(f"\nGenerating {num_samples} samples (chunk_size={chunk_size})...")
+        all_gen = []
+        n_chunks = (num_samples + chunk_size - 1) // chunk_size
+        for c in range(n_chunks):
+            cur = min(chunk_size, num_samples - c * chunk_size)
+            x = tf.random.normal((cur, latent_dim), dtype=tf.float32)
+            for i in range(self.num_timesteps - 1, -1, -1):
+                t = tf.ones((cur,), dtype=tf.int32) * i
+                x = self.p_sample(x, t, i)
+                if verbose and (i % 100 == 0 or i < 5):
+                    print(f"  [chunk {c+1}/{n_chunks}] Timestep {i + 1}/{self.num_timesteps}")
+            generated = self.decoder(x, training=training)
+            if isinstance(generated, tf.Tensor):
+                generated = generated.numpy()
+            generated = np.clip(generated, -1.0, 1.0)
+            all_gen.append(generated)
+            del x, generated
+            gc.collect()
+        out = np.concatenate(all_gen, axis=0)
+        if verbose:
+            print(f"Sample generation complete. Mean abs: {np.mean(np.abs(out)):.4f}")
+            print(f"Range: [{out.min():.3f}, {out.max():.3f}]")
+        return out
+
+    def train_step(self, data):
+        images = data[0] if isinstance(data, tuple) else data
+        images = tf.cast(images, tf.float32)
+        batch_size = tf.shape(images)[0]
+        with tf.GradientTape() as tape:
+            z_mean, z_log_var = self.encoder(images, training=True)
+            latents = self.reparameterize(z_mean, z_log_var)
+
+            t = self.sample_timesteps(batch_size)
+            noise = tf.random.normal(tf.shape(latents), dtype=tf.float32)
+            noisy = self.q_sample(latents, t, noise)
+            t_r = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
+            pred = self.unet([noisy, t_r], training=True)
+            diff_loss = tf.reduce_mean(tf.square(pred - noise))
+
+            recon = tf.cast(self.decoder(latents, training=True), tf.float32)
+            recon_loss = tf.reduce_mean(tf.square(images - recon))
+
+            kl_loss = self.compute_kl_loss(z_mean, z_log_var)
+            total = diff_loss + beta * recon_loss + self.kl_weight * kl_loss
+
+        grads = tape.gradient(total, self.trainable_variables)
+        grads = [tf.clip_by_norm(g, 1.0) for g in grads if g is not None]
+        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+
+        self.total_loss_tracker.update_state(total)
+        self.diffusion_loss_tracker.update_state(diff_loss)
+        self.reconstruction_loss_tracker.update_state(recon_loss)
+        self.kl_loss_tracker.update_state(kl_loss)
+        return {
+            "loss": self.total_loss_tracker.result(),
+            "diffusion_loss": self.diffusion_loss_tracker.result(),
+            "reconstruction_loss": self.reconstruction_loss_tracker.result(),
+            "kl_loss": self.kl_loss_tracker.result()
+        }
+
+    def test_step(self, data):
+        images = data[0] if isinstance(data, tuple) else data
+        images = tf.cast(images, tf.float32)
+        batch_size = tf.shape(images)[0]
+        z_mean, z_log_var = self.encoder(images, training=False)
+        latents = self.reparameterize(z_mean, z_log_var)
+
+        t = self.sample_timesteps(batch_size)
+        noise = tf.random.normal(tf.shape(latents), dtype=tf.float32)
+        noisy = self.q_sample(latents, t, noise)
+        t_r = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
+        pred = self.unet([noisy, t_r], training=False)
+        diff_loss = tf.reduce_mean(tf.square(pred - noise))
+
+        recon = tf.cast(self.decoder(latents, training=False), tf.float32)
+        recon_loss = tf.reduce_mean(tf.square(images - recon))
+
+        kl_loss = self.compute_kl_loss(z_mean, z_log_var)
+        total = diff_loss + beta * recon_loss + self.kl_weight * kl_loss
+
+        self.total_loss_tracker.update_state(total)
+        self.diffusion_loss_tracker.update_state(diff_loss)
+        self.reconstruction_loss_tracker.update_state(recon_loss)
+        self.kl_loss_tracker.update_state(kl_loss)
+        return {
+            "loss": self.total_loss_tracker.result(),
+            "diffusion_loss": self.diffusion_loss_tracker.result(),
+            "reconstruction_loss": self.reconstruction_loss_tracker.result(),
+            "kl_loss": self.kl_loss_tracker.result()
+        }
+
+    def call(self, inputs):
+        images = inputs[0] if isinstance(inputs, tuple) else inputs
+        images = tf.cast(images, tf.float32)
+        z_mean, z_log_var = self.encoder(images, training=False)
+        latents = self.reparameterize(z_mean, z_log_var)
+        bs = tf.shape(images)[0]
+        t = tf.random.uniform((bs,), 0, self.num_timesteps, dtype=tf.int32)
+        noisy = self.q_sample(latents, t)
+        t_r = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
+        return self.unet([noisy, t_r])
+
+
+diffusion_model = DiffusionModel(
+    encoder, decoder, unet,
+    num_timesteps=num_timesteps,
+    beta_start=beta_start,
+    beta_end=beta_end,
+    kl_weight=kl_weight
+)
+
+dummy_input = tf.random.normal((1, ni, nj, nz), dtype=tf.float32)
+_ = diffusion_model(dummy_input)
+diffusion_model.compile()
+
+print("\n" + "=" * 60)
+print("VAE ENCODER SUMMARY")
+print("=" * 60)
+encoder.summary()
+print("=" * 60)
+print("UNET ARCHITECTURE SUMMARY")
+print("=" * 60)
+unet.summary()
+print("=" * 60 + "\n")
+
+
+# ============================================================================
+# 4. METRICS & UTILITIES
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 4.1 Memory optimizer
+# ----------------------------------------------------------------------------
 class MemoryOptimizer:
     @staticmethod
     def memory_usage():
@@ -329,6 +579,9 @@ class MemoryOptimizer:
         return False
 
 
+# ----------------------------------------------------------------------------
+# 4.2 Static geostatistical metrics
+# ----------------------------------------------------------------------------
 class StaticMetrics:
     @staticmethod
     def variogram_2d(data, lag_distances=None, max_lag=None):
@@ -537,6 +790,132 @@ class StaticMetrics:
         return metrics
 
 
+# ----------------------------------------------------------------------------
+# 4.3 Stable FID / KID utilities
+# ----------------------------------------------------------------------------
+def frechet_distance_stable(act_real, act_gen, eps=FID_EPS):
+    mu_r = np.mean(act_real, axis=0)
+    mu_g = np.mean(act_gen, axis=0)
+    sigma_r = np.cov(act_real, rowvar=False)
+    sigma_g = np.cov(act_gen, rowvar=False)
+    sigma_r = np.atleast_2d(sigma_r)
+    sigma_g = np.atleast_2d(sigma_g)
+    sigma_r = sigma_r + np.eye(sigma_r.shape[0]) * eps
+    sigma_g = sigma_g + np.eye(sigma_g.shape[0]) * eps
+    diff = mu_r - mu_g
+    mean_diff = float(np.dot(diff, diff))
+    covmean = sqrtm(sigma_r @ sigma_g)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    trace_term = float(np.trace(sigma_r + sigma_g - 2.0 * covmean))
+    fid = mean_diff + trace_term
+    if not np.isfinite(fid):
+        return 1e12
+    return max(fid, 0.0)
+
+
+def frechet_distance_batched(real_features, fake_features,
+                              n_batches=10, batch_size=1000, eps=FID_EPS):
+    """
+    Computes the Frechet Distance using batched computation over 10 batches of 1000 samples.
+    Accumulates the statistics (mean and covariance) incrementally between batches,
+    without keeping all features at once to compute the statistics.
+    """
+    real_features = np.asarray(real_features, dtype=np.float64)
+    fake_features = np.asarray(fake_features, dtype=np.float64)
+
+    real_features = np.nan_to_num(real_features, nan=0.0, posinf=0.0, neginf=0.0)
+    fake_features = np.nan_to_num(fake_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Accumulate statistics for the real features
+    real_sum = np.zeros(real_features.shape[1], dtype=np.float64)
+    real_sum_sq = np.zeros((real_features.shape[1], real_features.shape[1]), dtype=np.float64)
+    real_count = 0
+
+    for i in range(n_batches):
+        start = i * batch_size
+        end = start + batch_size
+        batch = real_features[start:end]
+        if batch.shape[0] == 0:
+            continue
+        real_sum += batch.sum(axis=0)
+        real_sum_sq += batch.T @ batch
+        real_count += batch.shape[0]
+
+    mu_r = real_sum / real_count
+    sigma_r = (real_sum_sq / real_count) - np.outer(mu_r, mu_r)
+
+    # Accumulate statistics for the generated features
+    fake_sum = np.zeros(fake_features.shape[1], dtype=np.float64)
+    fake_sum_sq = np.zeros((fake_features.shape[1], fake_features.shape[1]), dtype=np.float64)
+    fake_count = 0
+
+    for i in range(n_batches):
+        start = i * batch_size
+        end = start + batch_size
+        batch = fake_features[start:end]
+        if batch.shape[0] == 0:
+            continue
+        fake_sum += batch.sum(axis=0)
+        fake_sum_sq += batch.T @ batch
+        fake_count += batch.shape[0]
+
+    mu_g = fake_sum / fake_count
+    sigma_g = (fake_sum_sq / fake_count) - np.outer(mu_g, mu_g)
+
+    sigma_r = np.atleast_2d(sigma_r)
+    sigma_g = np.atleast_2d(sigma_g)
+    sigma_r = sigma_r + np.eye(sigma_r.shape[0]) * eps
+    sigma_g = sigma_g + np.eye(sigma_g.shape[0]) * eps
+
+    diff = mu_r - mu_g
+    mean_diff = float(np.dot(diff, diff))
+    covmean = sqrtm(sigma_r @ sigma_g)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    trace_term = float(np.trace(sigma_r + sigma_g - 2.0 * covmean))
+    fid = mean_diff + trace_term
+    if not np.isfinite(fid):
+        return 1e12
+    return max(fid, 0.0)
+
+
+def kernel_distance_stable(act_real, act_gen, num_blocks=50, max_block_size=500):
+    n = min(len(act_real), len(act_gen), max_block_size)
+    x = act_real[:n]
+    y = act_gen[:n]
+    d = x.shape[1]
+    k = 3
+    coef = 1.0 / d
+
+    def poly_kernel(a, b):
+        return (a @ b.T / d + coef) ** k
+
+    k_xx = poly_kernel(x, x).mean()
+    k_yy = poly_kernel(y, y).mean()
+    k_xy = poly_kernel(x, y).mean()
+    mmd2 = k_xx + k_yy - 2 * k_xy
+    return max(float(mmd2), 0.0)
+
+
+# ----------------------------------------------------------------------------
+# 4.4 Feature extractors
+# ----------------------------------------------------------------------------
+def get_feature_extractors():
+    iv3 = InceptionV3(include_top=False, pooling='avg', input_shape=(75, 75, 3))
+    f_extraction_iv3 = Model(inputs=iv3.input, outputs=iv3.layers[-1].output)
+    RC_full = load_model('Reservoir_classifier.h5')
+    f_extraction_rc = Model(inputs=RC_full.input,
+                            outputs=layers.GlobalAveragePooling2D()(RC_full.layers[-5].output))
+    return f_extraction_iv3, f_extraction_rc
+
+
+f_extraction_iv3, f_extraction_rc = get_feature_extractors()
+
+
+# ----------------------------------------------------------------------------
+# 4.5 Plotting utilities
+# ----------------------------------------------------------------------------
 def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
     if formats is None:
         formats = HIGH_RES_CONFIG['save_formats']
@@ -554,424 +933,6 @@ def save_figure_multiple_formats(fig, base_filename, dpi=300, formats=None):
         saved_files.append(filename)
         print(f"  Saved: {filename}")
     return saved_files
-
-
-def get_feature_extractors():
-    iv3 = InceptionV3(include_top=False, pooling='avg', input_shape=(75, 75, 3))
-    f_extraction_iv3 = Model(inputs=iv3.input, outputs=iv3.layers[-1].output)
-    RC_full = load_model('Reservoir_classifier.h5')
-    f_extraction_rc = Model(inputs=RC_full.input,
-                            outputs=layers.GlobalAveragePooling2D()(RC_full.layers[-5].output))
-    return f_extraction_iv3, f_extraction_rc
-
-
-f_extraction_iv3, f_extraction_rc = get_feature_extractors()
-
-
-# ==============================================
-# VAE ENCODER + DECODER
-# ==============================================
-
-def build_vae_encoder(input_shape, latent_dim):
-    inputs = keras.Input(shape=input_shape, dtype=tf.float32)
-    x = layers.Conv2D(32, 3, strides=2, padding="same", dtype=tf.float32)(inputs)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization(dtype=tf.float32)(x)
-    x = layers.Conv2D(64, 3, strides=2, padding="same", dtype=tf.float32)(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization(dtype=tf.float32)(x)
-    x = layers.Conv2D(128, 3, strides=2, padding="same", dtype=tf.float32)(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization(dtype=tf.float32)(x)
-    x = layers.Conv2D(256, 3, strides=2, padding="same", dtype=tf.float32)(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization(dtype=tf.float32)(x)
-    x = layers.Dropout(0.4)(x)
-    x = layers.Flatten()(x)
-    x = layers.Dense(256, dtype=tf.float32)(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.3)(x)
-    z_mean = layers.Dense(latent_dim, name="z_mean", dtype=tf.float32)(x)
-    z_log_var = layers.Dense(latent_dim, name="z_log_var", dtype=tf.float32)(x)
-    return keras.Model(inputs, [z_mean, z_log_var], name="vae_encoder")
-
-
-encoder = build_vae_encoder((ni, nj, nz), latent_dim)
-
-
-def build_decoder(latent_dim, output_shape):
-    latent_inputs = keras.Input(shape=(latent_dim,), dtype=tf.float32)
-    x = layers.Dense(6 * 6 * 256, dtype=tf.float32)(latent_inputs)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.Dropout(0.2)(x)
-    x = layers.Reshape((6, 6, 256))(x)
-    x = layers.Conv2DTranspose(128, 3, strides=2, padding="same", dtype=tf.float32)(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization(dtype=tf.float32)(x)
-    x = layers.Conv2DTranspose(64, 3, strides=2, padding="same", dtype=tf.float32)(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization(dtype=tf.float32)(x)
-    x = layers.Conv2DTranspose(32, 3, strides=2, padding="same", dtype=tf.float32)(x)
-    x = LeakyReLU(alpha=0.2)(x)
-    x = layers.BatchNormalization(dtype=tf.float32)(x)
-    outputs = layers.Conv2D(output_shape[-1], 3, activation="tanh", padding="same", dtype=tf.float32)(x)
-    return keras.Model(latent_inputs, outputs, name="decoder")
-
-
-decoder = build_decoder(latent_dim, (ni, nj, nz))
-
-
-# ==============================================
-# REAL 1D UNET DENOISER
-# ==============================================
-
-def build_unet_model(latent_dim, time_emb_dim=256, base_filters=64):
-    assert latent_dim % 8 == 0, \
-        f"latent_dim must be divisible by 8 for 3 pooling levels (got {latent_dim})"
-
-    def sinusoidal_embedding(x):
-        half_dim = time_emb_dim // 2
-        emb = tf.math.log(10000.0) / (half_dim - 1)
-        emb = tf.exp(tf.range(half_dim, dtype=tf.float32) * -emb)
-        x = tf.cast(x, tf.float32)
-        emb = x * emb
-        return tf.concat([tf.sin(emb), tf.cos(emb)], axis=1)
-
-    def time_mlp(t_emb):
-        x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_1")(t_emb)
-        x = layers.Dense(time_emb_dim, activation="swish", name="t_mlp_2")(x)
-        return x
-
-    def res_block(x, t_emb, filters, name):
-        h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv1")(x)
-        h = layers.LayerNormalization(name=f"{name}_ln1")(h)
-        h = layers.Activation("swish", name=f"{name}_act1")(h)
-        t = layers.Dense(filters, name=f"{name}_tproj")(t_emb)
-        t = layers.Reshape((1, filters), name=f"{name}_treshape")(t)
-        h = layers.Add(name=f"{name}_tadd")([h, t])
-        h = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv2")(h)
-        h = layers.LayerNormalization(name=f"{name}_ln2")(h)
-        if x.shape[-1] != filters:
-            x = layers.Conv1D(filters, 1, padding="same", name=f"{name}_skip_proj")(x)
-        out = layers.Add(name=f"{name}_resadd")([x, h])
-        return layers.Activation("swish", name=f"{name}_out")(out)
-
-    def downsample(x, filters, name):
-        return layers.Conv1D(filters, 4, strides=2, padding="same", name=f"{name}_down")(x)
-
-    def upsample_with_skip(x, skip, filters, name):
-        x = layers.UpSampling1D(size=2, name=f"{name}_up")(x)
-        assert x.shape[1] == skip.shape[1]
-        x = layers.Concatenate(name=f"{name}_concat")([x, skip])
-        x = layers.Conv1D(filters, 3, padding="same", name=f"{name}_conv")(x)
-        x = layers.LayerNormalization(name=f"{name}_ln")(x)
-        return layers.Activation("swish", name=f"{name}_act")(x)
-
-    latent_input = keras.Input(shape=(latent_dim,), dtype=tf.float32, name="latent_input")
-    time_input = keras.Input(shape=(1,), dtype=tf.float32, name="time_input")
-
-    t_emb = sinusoidal_embedding(time_input)
-    t_emb = time_mlp(t_emb)
-
-    x = layers.Reshape((latent_dim, 1), name="reshape_input")(latent_input)
-    x = layers.Conv1D(base_filters, 3, padding="same", name="input_conv")(x)
-
-    e0 = res_block(x, t_emb, base_filters, "enc0")
-    d1 = downsample(e0, base_filters * 2, "enc1_down")
-    e1 = res_block(d1, t_emb, base_filters * 2, "enc1")
-    d2 = downsample(e1, base_filters * 4, "enc2_down")
-    e2 = res_block(d2, t_emb, base_filters * 4, "enc2")
-    d3 = downsample(e2, base_filters * 8, "enc3_down")
-    e3 = res_block(d3, t_emb, base_filters * 8, "enc3")
-
-    b = res_block(e3, t_emb, base_filters * 8, "bottleneck_1")
-    b = res_block(b, t_emb, base_filters * 8, "bottleneck_2")
-
-    u3 = upsample_with_skip(b, e2, base_filters * 4, "dec3")
-    u3 = res_block(u3, t_emb, base_filters * 4, "dec3_res")
-    u2 = upsample_with_skip(u3, e1, base_filters * 2, "dec2")
-    u2 = res_block(u2, t_emb, base_filters * 2, "dec2_res")
-    u1 = upsample_with_skip(u2, e0, base_filters, "dec1")
-    u1 = res_block(u1, t_emb, base_filters, "dec1_res")
-
-    out = layers.Conv1D(base_filters, 3, padding="same", name="out_conv1")(u1)
-    out = layers.Activation("swish", name="out_act")(out)
-    out = layers.Conv1D(1, 3, padding="same", name="out_conv2")(out)
-    out = layers.Reshape((latent_dim,), name="output_reshape")(out)
-
-    return keras.Model([latent_input, time_input], out, name="unet_1d")
-
-
-unet = build_unet_model(latent_dim, time_emb_dim=256, base_filters=64)
-
-
-# ==============================================
-# DIFFUSION MODEL
-# ==============================================
-
-class DiffusionModel(keras.Model):
-    def __init__(self, encoder, decoder, unet, num_timesteps=500,
-                 beta_start=0.0001, beta_end=0.04, kl_weight=0.0001, **kwargs):
-        super().__init__(**kwargs)
-        self.encoder = encoder
-        self.decoder = decoder
-        self.unet = unet
-        self.num_timesteps = num_timesteps
-        # tf.Variable to allow runtime adjustment without re-tracing the graph
-        self.kl_weight = tf.Variable(float(kl_weight), trainable=False,
-                                     dtype=tf.float32, name="kl_weight")
-
-        self.betas = tf.cast(tf.linspace(beta_start, beta_end, num_timesteps), tf.float32)
-        self.alphas = 1. - self.betas
-        self.alphas_cumprod = tf.math.cumprod(self.alphas, axis=0)
-        self.sqrt_alphas_cumprod = tf.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = tf.sqrt(1. - self.alphas_cumprod)
-        self.sqrt_recip_alphas = tf.sqrt(1.0 / self.alphas)
-        alphas_cumprod_prev = tf.concat([[1.0], self.alphas_cumprod[:-1]], axis=0)
-        self.posterior_variance = self.betas * (1. - alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-
-        self.total_loss_tracker = keras.metrics.Mean(name="total_loss", dtype=tf.float32)
-        self.diffusion_loss_tracker = keras.metrics.Mean(name="diffusion_loss", dtype=tf.float32)
-        self.reconstruction_loss_tracker = keras.metrics.Mean(name="reconstruction_loss", dtype=tf.float32)
-        self.kl_loss_tracker = keras.metrics.Mean(name="kl_loss", dtype=tf.float32)
-
-    @property
-    def metrics(self):
-        return [self.total_loss_tracker, self.diffusion_loss_tracker,
-                self.reconstruction_loss_tracker, self.kl_loss_tracker]
-
-    def compile(self, **kwargs):
-        super().compile(**kwargs)
-        self.optimizer = keras.optimizers.Adam(learning_rate=initial_lr, beta_1=0.5, clipnorm=1.0)
-
-    def reparameterize(self, z_mean, z_log_var):
-        eps = tf.random.normal(shape=tf.shape(z_mean), dtype=tf.float32)
-        return z_mean + tf.exp(0.5 * z_log_var) * eps
-
-    def compute_kl_loss(self, z_mean, z_log_var):
-        kl = -0.5 * tf.reduce_sum(1.0 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=-1)
-        return tf.reduce_mean(kl)
-
-    def sample_timesteps(self, batch_size):
-        return tf.random.uniform(shape=(batch_size,), minval=0,
-                                 maxval=self.num_timesteps, dtype=tf.int32)
-
-    def q_sample(self, x_start, t, noise=None):
-        if noise is None:
-            noise = tf.random.normal(tf.shape(x_start), dtype=tf.float32)
-        a = tf.gather(self.sqrt_alphas_cumprod, t)
-        b = tf.gather(self.sqrt_one_minus_alphas_cumprod, t)
-        a = tf.reshape(a, [-1] + [1] * (len(x_start.shape) - 1))
-        b = tf.reshape(b, [-1] + [1] * (len(x_start.shape) - 1))
-        return a * x_start + b * noise
-
-    def p_sample(self, x, t, t_index):
-        betas_t = tf.gather(self.betas, t)
-        sqrt_one_minus = tf.gather(self.sqrt_one_minus_alphas_cumprod, t)
-        sqrt_recip = tf.gather(self.sqrt_recip_alphas, t)
-        betas_t = tf.reshape(betas_t, [-1] + [1] * (len(x.shape) - 1))
-        sqrt_one_minus = tf.reshape(sqrt_one_minus, [-1] + [1] * (len(x.shape) - 1))
-        sqrt_recip = tf.reshape(sqrt_recip, [-1] + [1] * (len(x.shape) - 1))
-        t_batch = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
-        model_output = self.unet([x, t_batch], training=False)
-        model_mean = sqrt_recip * (x - betas_t * model_output / sqrt_one_minus)
-        if t_index == 0:
-            return model_mean
-        posterior_variance_t = tf.gather(self.posterior_variance, t)
-        posterior_variance_t = tf.reshape(posterior_variance_t, [-1] + [1] * (len(x.shape) - 1))
-        noise = tf.random.normal(shape=tf.shape(x), dtype=tf.float32)
-        return model_mean + tf.sqrt(posterior_variance_t) * noise
-
-    def sample(self, num_samples, training=False, verbose=True, chunk_size=SAMPLE_CHUNK_SIZE):
-        if verbose:
-            print(f"\nGenerating {num_samples} samples (chunk_size={chunk_size})...")
-        all_gen = []
-        n_chunks = (num_samples + chunk_size - 1) // chunk_size
-        for c in range(n_chunks):
-            cur = min(chunk_size, num_samples - c * chunk_size)
-            x = tf.random.normal((cur, latent_dim), dtype=tf.float32)
-            for i in range(self.num_timesteps - 1, -1, -1):
-                t = tf.ones((cur,), dtype=tf.int32) * i
-                x = self.p_sample(x, t, i)
-                if verbose and (i % 100 == 0 or i < 5):
-                    print(f"  [chunk {c+1}/{n_chunks}] Timestep {i + 1}/{self.num_timesteps}")
-            generated = self.decoder(x, training=training)
-            if isinstance(generated, tf.Tensor):
-                generated = generated.numpy()
-            generated = np.clip(generated, -1.0, 1.0)
-            all_gen.append(generated)
-            del x, generated
-            gc.collect()
-        out = np.concatenate(all_gen, axis=0)
-        if verbose:
-            print(f"Sample generation complete. Mean abs: {np.mean(np.abs(out)):.4f}")
-            print(f"Range: [{out.min():.3f}, {out.max():.3f}]")
-        return out
-
-    def train_step(self, data):
-        images = data[0] if isinstance(data, tuple) else data
-        images = tf.cast(images, tf.float32)
-        batch_size = tf.shape(images)[0]
-        with tf.GradientTape() as tape:
-            z_mean, z_log_var = self.encoder(images, training=True)
-            latents = self.reparameterize(z_mean, z_log_var)
-
-            t = self.sample_timesteps(batch_size)
-            noise = tf.random.normal(tf.shape(latents), dtype=tf.float32)
-            noisy = self.q_sample(latents, t, noise)
-            t_r = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
-            pred = self.unet([noisy, t_r], training=True)
-            diff_loss = tf.reduce_mean(tf.square(pred - noise))
-
-            recon = tf.cast(self.decoder(latents, training=True), tf.float32)
-            recon_loss = tf.reduce_mean(tf.square(images - recon))
-
-            kl_loss = self.compute_kl_loss(z_mean, z_log_var)
-            total = diff_loss + beta * recon_loss + self.kl_weight * kl_loss
-
-        grads = tape.gradient(total, self.trainable_variables)
-        grads = [tf.clip_by_norm(g, 1.0) for g in grads if g is not None]
-        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
-
-        self.total_loss_tracker.update_state(total)
-        self.diffusion_loss_tracker.update_state(diff_loss)
-        self.reconstruction_loss_tracker.update_state(recon_loss)
-        self.kl_loss_tracker.update_state(kl_loss)
-        return {
-            "loss": self.total_loss_tracker.result(),
-            "diffusion_loss": self.diffusion_loss_tracker.result(),
-            "reconstruction_loss": self.reconstruction_loss_tracker.result(),
-            "kl_loss": self.kl_loss_tracker.result()
-        }
-
-    def test_step(self, data):
-        images = data[0] if isinstance(data, tuple) else data
-        images = tf.cast(images, tf.float32)
-        batch_size = tf.shape(images)[0]
-        z_mean, z_log_var = self.encoder(images, training=False)
-        latents = self.reparameterize(z_mean, z_log_var)
-
-        t = self.sample_timesteps(batch_size)
-        noise = tf.random.normal(tf.shape(latents), dtype=tf.float32)
-        noisy = self.q_sample(latents, t, noise)
-        t_r = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
-        pred = self.unet([noisy, t_r], training=False)
-        diff_loss = tf.reduce_mean(tf.square(pred - noise))
-
-        recon = tf.cast(self.decoder(latents, training=False), tf.float32)
-        recon_loss = tf.reduce_mean(tf.square(images - recon))
-
-        kl_loss = self.compute_kl_loss(z_mean, z_log_var)
-        total = diff_loss + beta * recon_loss + self.kl_weight * kl_loss
-
-        self.total_loss_tracker.update_state(total)
-        self.diffusion_loss_tracker.update_state(diff_loss)
-        self.reconstruction_loss_tracker.update_state(recon_loss)
-        self.kl_loss_tracker.update_state(kl_loss)
-        return {
-            "loss": self.total_loss_tracker.result(),
-            "diffusion_loss": self.diffusion_loss_tracker.result(),
-            "reconstruction_loss": self.reconstruction_loss_tracker.result(),
-            "kl_loss": self.kl_loss_tracker.result()
-        }
-
-    def call(self, inputs):
-        images = inputs[0] if isinstance(inputs, tuple) else inputs
-        images = tf.cast(images, tf.float32)
-        z_mean, z_log_var = self.encoder(images, training=False)
-        latents = self.reparameterize(z_mean, z_log_var)
-        bs = tf.shape(images)[0]
-        t = tf.random.uniform((bs,), 0, self.num_timesteps, dtype=tf.int32)
-        noisy = self.q_sample(latents, t)
-        t_r = tf.reshape(tf.cast(t, tf.float32), [-1, 1])
-        return self.unet([noisy, t_r])
-
-
-diffusion_model = DiffusionModel(
-    encoder, decoder, unet,
-    num_timesteps=num_timesteps,
-    beta_start=beta_start,
-    beta_end=beta_end,
-    kl_weight=kl_weight
-)
-
-dummy_input = tf.random.normal((1, ni, nj, nz), dtype=tf.float32)
-_ = diffusion_model(dummy_input)
-diffusion_model.compile()
-
-print("\n" + "=" * 60)
-print("VAE ENCODER SUMMARY")
-print("=" * 60)
-encoder.summary()
-print("=" * 60)
-print("UNET ARCHITECTURE SUMMARY")
-print("=" * 60)
-unet.summary()
-print("=" * 60 + "\n")
-
-
-def lr_scheduler(epoch):
-    decay_rate = 0.95
-    decay_step = 50
-    if epoch > 0 and epoch % decay_step == 0:
-        return initial_lr * (decay_rate ** (epoch // decay_step))
-    return initial_lr
-
-
-def perceptual_loss(real_images, fake_images):
-    real_images_resized = tf.image.resize(real_images, [75, 75])
-    fake_images_resized = tf.image.resize(fake_images, [75, 75])
-    if real_images.shape[-1] == 1:
-        real_images_resized = tf.repeat(real_images_resized, 3, axis=-1)
-        fake_images_resized = tf.repeat(fake_images_resized, 3, axis=-1)
-    real_features_iv3 = f_extraction_iv3(real_images_resized)
-    fake_features_iv3 = f_extraction_iv3(fake_images_resized)
-    real_features_rc = f_extraction_rc(real_images)
-    fake_features_rc = f_extraction_rc(fake_images)
-    loss_iv3 = tf.reduce_mean(tf.square(real_features_iv3 - fake_features_iv3))
-    loss_rc = tf.reduce_mean(tf.square(real_features_rc - fake_features_rc))
-    return loss_iv3 + loss_rc
-
-
-# ===== MINIMAL CORRECTION #2a: continuous decoder sanity check function =====
-def sanity_check_decoder(encoder, decoder, data, n=20):
-    """
-    Confirms that decoder(encoder_mean(x)) ≈ x, both in the normalized space [-1,1].
-
-    - In the 3facies case (code 1) the sanity check compares softmax+argmax vs
-      expected-value+round. Here, in the continuous case, we compare directly the
-      reconstruction with the original input (MSE/MAE/correlation).
-
-    Acceptance criteria (unisim continuous case):
-      MAE  < 0.05   (good)
-      Corr > 0.90   (good spatial reconstruction)
-    """
-    idx = np.random.choice(len(data), size=min(n, len(data)), replace=False)
-    x_batch = data[idx]
-
-    z_mean, _ = encoder.predict(x_batch, verbose=0)
-    y_rec = decoder.predict(z_mean, verbose=0)
-
-    mae = float(np.mean(np.abs(x_batch - y_rec)))
-    rmse = float(np.sqrt(np.mean((x_batch - y_rec) ** 2)))
-    corr = float(np.corrcoef(x_batch.flatten(), y_rec.flatten())[0, 1])
-
-    print("\n" + "=" * 60)
-    print("SANITY CHECK: DECODER (VAE continuous, tanh)")
-    print("=" * 60)
-    print(f"  x.shape              : {x_batch.shape}")
-    print(f"  y_rec.shape          : {y_rec.shape}")
-    print(f"  x range              : [{x_batch.min():.3f}, {x_batch.max():.3f}]")
-    print(f"  y_rec range          : [{y_rec.min():.3f}, {y_rec.max():.3f}]  (expected ~[-1,1])")
-    print(f"  MAE                  : {mae:.6e}  (expected < 0.05)")
-    print(f"  RMSE                 : {rmse:.6e}")
-    print(f"  Pearson correlation  : {corr:.4f}  (expected > 0.90)")
-    if mae > 0.1 or corr < 0.8:
-        print("  ⚠️  WARNING: bad reconstruction. Check VAE/decoder.")
-    print("=" * 60 + "\n")
-
-    return mae, rmse, corr
-# ===========================================================================
 
 
 def plot_histograms_and_densities(original, reconstructed, latent, epoch=None, save_interval=10):
@@ -1058,9 +1019,495 @@ def analyze_latent_space(encoder, data, num_samples=1000):
     return z_mean.flatten()
 
 
-# ==============================================
-# CALLBACKS
-# ==============================================
+# ----------------------------------------------------------------------------
+# 4.6 Sanity check + perceptual + LR scheduler
+# ----------------------------------------------------------------------------
+def lr_scheduler(epoch):
+    decay_rate = 0.95
+    decay_step = 50
+    if epoch > 0 and epoch % decay_step == 0:
+        return initial_lr * (decay_rate ** (epoch // decay_step))
+    return initial_lr
+
+
+def perceptual_loss(real_images, fake_images):
+    real_images_resized = tf.image.resize(real_images, [75, 75])
+    fake_images_resized = tf.image.resize(fake_images, [75, 75])
+    if real_images.shape[-1] == 1:
+        real_images_resized = tf.repeat(real_images_resized, 3, axis=-1)
+        fake_images_resized = tf.repeat(fake_images_resized, 3, axis=-1)
+    real_features_iv3 = f_extraction_iv3(real_images_resized)
+    fake_features_iv3 = f_extraction_iv3(fake_images_resized)
+    real_features_rc = f_extraction_rc(real_images)
+    fake_features_rc = f_extraction_rc(fake_images)
+    loss_iv3 = tf.reduce_mean(tf.square(real_features_iv3 - fake_features_iv3))
+    loss_rc = tf.reduce_mean(tf.square(real_features_rc - fake_features_rc))
+    return loss_iv3 + loss_rc
+
+
+# ===== MINIMAL CORRECTION #2a: continuous decoder sanity check function =====
+def sanity_check_decoder(encoder, decoder, data, n=20):
+    """
+    Confirms that decoder(encoder_mean(x)) ≈ x, both in the normalized space [-1,1].
+
+    - In the 3facies case (code 1) the sanity check compares softmax+argmax vs
+      expected-value+round. Here, in the continuous case, we compare directly the
+      reconstruction with the original input (MSE/MAE/correlation).
+
+    Acceptance criteria (unisim continuous case):
+      MAE  < 0.05   (good)
+      Corr > 0.90   (good spatial reconstruction)
+    """
+    idx = np.random.choice(len(data), size=min(n, len(data)), replace=False)
+    x_batch = data[idx]
+
+    z_mean, _ = encoder.predict(x_batch, verbose=0)
+    y_rec = decoder.predict(z_mean, verbose=0)
+
+    mae = float(np.mean(np.abs(x_batch - y_rec)))
+    rmse = float(np.sqrt(np.mean((x_batch - y_rec) ** 2)))
+    corr = float(np.corrcoef(x_batch.flatten(), y_rec.flatten())[0, 1])
+
+    print("\n" + "=" * 60)
+    print("SANITY CHECK: DECODER (VAE continuous, tanh)")
+    print("=" * 60)
+    print(f"  x.shape              : {x_batch.shape}")
+    print(f"  y_rec.shape          : {y_rec.shape}")
+    print(f"  x range              : [{x_batch.min():.3f}, {x_batch.max():.3f}]")
+    print(f"  y_rec range          : [{y_rec.min():.3f}, {y_rec.max():.3f}]  (expected ~[-1,1])")
+    print(f"  MAE                  : {mae:.6e}  (expected < 0.05)")
+    print(f"  RMSE                 : {rmse:.6e}")
+    print(f"  Pearson correlation  : {corr:.4f}  (expected > 0.90)")
+    if mae > 0.1 or corr < 0.8:
+        print("  ⚠️  WARNING: bad reconstruction. Check VAE/decoder.")
+    print("=" * 60 + "\n")
+
+    return mae, rmse, corr
+# ===========================================================================
+
+
+# ----------------------------------------------------------------------------
+# 4.7 Loss plot utilities
+# ----------------------------------------------------------------------------
+def plot_losses(loss_history, save_prefix="latent_diffusion", save_interval=10, total_epochs=epochs):
+    figsize = (22 * HIGH_RES_CONFIG['figsize_multiplier'],
+               14 * HIGH_RES_CONFIG['figsize_multiplier'])
+    fig = plt.figure(figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
+    plt.rcParams.update({
+        'font.size': 20, 'axes.titlesize': 24, 'axes.labelsize': 22,
+        'xtick.labelsize': 18, 'ytick.labelsize': 18, 'legend.fontsize': 18
+    })
+    epochs_range = range(1, len(loss_history.total_losses) + 1)
+    plt.subplot(2, 2, 1)
+    plt.plot(epochs_range, loss_history.total_losses, label='Training Total Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
+    plt.plot(epochs_range, loss_history.val_total_losses, label='Validation Total Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
+    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
+    plt.ylabel('Loss', fontweight='bold', fontsize=22)
+    plt.title('Total Loss', fontweight='bold', fontsize=24)
+    plt.legend(fontsize=18)
+    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
+    plt.subplot(2, 2, 2)
+    plt.plot(epochs_range, loss_history.diffusion_losses, label='Training Diffusion Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
+    plt.plot(epochs_range, loss_history.val_diffusion_losses, label='Validation Diffusion Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
+    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
+    plt.ylabel('Loss', fontweight='bold', fontsize=22)
+    plt.title('Diffusion Loss', fontweight='bold', fontsize=24)
+    plt.legend(fontsize=18)
+    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
+    plt.subplot(2, 2, 3)
+    plt.plot(epochs_range, loss_history.recon_losses, label='Training Recon Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
+    plt.plot(epochs_range, loss_history.val_recon_losses, label='Validation Recon Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
+    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
+    plt.ylabel('Loss', fontweight='bold', fontsize=22)
+    plt.title('Reconstruction Loss', fontweight='bold', fontsize=24)
+    plt.legend(fontsize=18)
+    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
+    plt.subplot(2, 2, 4)
+    plt.plot(epochs_range, loss_history.kl_losses, label='Training KL Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
+    plt.plot(epochs_range, loss_history.val_kl_losses, label='Validation KL Loss',
+             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
+    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
+    plt.ylabel('Loss', fontweight='bold', fontsize=22)
+    plt.title('KL Loss', fontweight='bold', fontsize=24)
+    plt.legend(fontsize=18)
+    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
+    plt.suptitle('Latent Diffusion (VAE) Training Losses', fontsize=26, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    base_filename = f"training_outputs/{save_prefix}_all_losses"
+    saved_files = save_figure_multiple_formats(fig, base_filename, HIGH_RES_CONFIG['dpi'])
+    plt.close(fig)
+    plot_individual_losses(loss_history, save_prefix)
+    return saved_files
+
+
+def plot_individual_losses(loss_history, save_prefix="latent_diffusion"):
+    epochs_range = range(1, len(loss_history.total_losses) + 1)
+    loss_types = [
+        ('total_loss', loss_history.total_losses, loss_history.val_total_losses, 'Total Loss'),
+        ('diffusion_loss', loss_history.diffusion_losses, loss_history.val_diffusion_losses, 'Diffusion Loss'),
+        ('recon_loss', loss_history.recon_losses, loss_history.val_recon_losses, 'Reconstruction Loss'),
+        ('kl_loss', loss_history.kl_losses, loss_history.val_kl_losses, 'KL Loss')
+    ]
+    for loss_name, train_loss, val_loss, title in loss_types:
+        fig, ax = plt.subplots(figsize=(12 * HIGH_RES_CONFIG['figsize_multiplier'],
+                                        8 * HIGH_RES_CONFIG['figsize_multiplier']),
+                               dpi=HIGH_RES_CONFIG['dpi'])
+        ax.plot(epochs_range, train_loss, label='Training', linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
+        ax.plot(epochs_range, val_loss, label='Validation', linewidth=HIGH_RES_CONFIG['line_width'], color='red')
+        ax.set_xlabel('Epochs', fontweight='bold', fontsize=22)
+        ax.set_ylabel('Loss', fontweight='bold', fontsize=22)
+        ax.set_title(f'Latent Diffusion (VAE): {title}', fontsize=24, fontweight='bold')
+        ax.legend(fontsize=18)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+        ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+        base_filename = f"training_outputs/{save_prefix}_{loss_name}"
+        save_figure_multiple_formats(fig, base_filename, HIGH_RES_CONFIG['dpi'])
+        plt.close(fig)
+
+
+def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=None,
+                                   sample_size=FID_SAMPLE_SIZE):
+    n_samples = min(sample_size, len(real_data))
+    fake_data = diffusion_model.sample(n_samples, training=False, verbose=False)
+    if isinstance(fake_data, tf.Tensor):
+        fake_data = fake_data.numpy()
+    if np.any(np.isnan(fake_data)):
+        fake_data = np.nan_to_num(fake_data, nan=0.0)
+    from sklearn.metrics.pairwise import rbf_kernel
+    metrics = {}
+    lags, variogram_real = StaticMetrics.variogram_2d_optimized(real_data[:100], max_lag=25)
+    _, variogram_fake = StaticMetrics.variogram_2d_optimized(fake_data[:100], max_lag=25)
+    metrics['variogram_mse'] = np.mean((variogram_real - variogram_fake) ** 2)
+    _, connectivity_real = StaticMetrics.connectivity_function(real_data[:100], 0.5, lag_distances=lags)
+    _, connectivity_fake = StaticMetrics.connectivity_function(fake_data[:100], 0.5, lag_distances=lags)
+    metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
+    real_flat = real_data.flatten()
+    fake_flat = fake_data.flatten()
+    all_data = np.concatenate([real_flat, fake_flat])
+    data_min, data_max = np.min(all_data), np.max(all_data)
+    hist_real, bin_edges = np.histogram(real_flat, bins=100, range=(data_min, data_max), density=False)
+    hist_fake, _ = np.histogram(fake_flat, bins=100, range=(data_min, data_max), density=False)
+    hist_real = hist_real.astype(float) / np.sum(hist_real)
+    hist_fake = hist_fake.astype(float) / np.sum(hist_fake)
+    epsilon = 1e-10
+    hist_real = np.clip(hist_real, epsilon, 1)
+    hist_fake = np.clip(hist_fake, epsilon, 1)
+    metrics['hist_kl'] = np.sum(hist_real * np.log(hist_real / hist_fake))
+    pca_real, _ = StaticMetrics.calculate_pca_features(real_data[:500])
+    pca_fake, _ = StaticMetrics.calculate_pca_features(fake_data[:500])
+    if pca_real.shape[0] == pca_fake.shape[0]:
+        n_components = min(2, pca_real.shape[1], pca_fake.shape[1])
+        pca_correlations = []
+        for i in range(n_components):
+            corr = np.corrcoef(pca_real[:, i], pca_fake[:, i])[0, 1]
+            pca_correlations.append(corr)
+        metrics['pca_correlation'] = np.mean(pca_correlations)
+    else:
+        metrics['pca_correlation'] = 0.0
+    mds_real = StaticMetrics.calculate_mds_features(real_data[:500])
+    mds_fake = StaticMetrics.calculate_mds_features(fake_data[:500])
+    n_samples = min(len(mds_real), len(mds_fake), 100)
+    mds_real_small = mds_real[:n_samples]
+    mds_fake_small = mds_fake[:n_samples]
+    if len(mds_real_small) > 0 and len(mds_fake_small) > 0:
+        X = np.vstack([mds_real_small, mds_fake_small])
+        pairwise_dists = pdist(X)
+        gamma = 1.0 / (2.0 * np.median(pairwise_dists) ** 2) if len(pairwise_dists) > 0 else 1.0
+        K_XX = rbf_kernel(mds_real_small, mds_real_small, gamma=gamma)
+        K_YY = rbf_kernel(mds_fake_small, mds_fake_small, gamma=gamma)
+        K_XY = rbf_kernel(mds_real_small, mds_fake_small, gamma=gamma)
+        mmd_squared = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
+        metrics['mds_mmd'] = np.sqrt(max(mmd_squared, 0))
+    else:
+        metrics['mds_mmd'] = 0.0
+    figsize = (22 * HIGH_RES_CONFIG['figsize_multiplier'],
+               14 * HIGH_RES_CONFIG['figsize_multiplier'])
+    fig, axes = plt.subplots(2, 3, figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
+    fig.suptitle('Latent Diffusion (VAE): Static Geostatistical Metrics Comparison',
+                 fontsize=26, fontweight='bold', y=1.02)
+    for ax in axes.flat:
+        ax.tick_params(labelsize=18, width=1.5)
+        ax.xaxis.label.set_size(22)
+        ax.yaxis.label.set_size(22)
+        ax.title.set_size(24)
+    ax = axes[0, 0]
+    ax.plot(lags, variogram_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
+    ax.plot(lags, variogram_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+    ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
+    ax.set_ylabel('Variogram', fontweight='bold', fontsize=22)
+    ax.set_title(f'Variogram (MSE: {metrics["variogram_mse"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[0, 1]
+    ax.plot(lags, connectivity_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
+    ax.plot(lags, connectivity_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+    ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
+    ax.set_ylabel('Connectivity', fontweight='bold', fontsize=22)
+    ax.set_title(f'Connectivity (MSE: {metrics["connectivity_mse"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[0, 2]
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bar_width = bin_centers[1] - bin_centers[0]
+    ax.bar(bin_centers, hist_real, width=bar_width, alpha=0.6, label='Real', color='blue', edgecolor='black')
+    ax.plot(bin_centers, hist_fake, 'r-', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
+    ax.set_xlabel('Value', fontweight='bold', fontsize=22)
+    ax.set_ylabel('Density', fontweight='bold', fontsize=22)
+    ax.set_title(f'Histogram (KL: {metrics["hist_kl"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[1, 0]
+    ax.scatter(pca_real[:100, 0], pca_real[:100, 1], alpha=0.6, label='Real',
+               s=HIGH_RES_CONFIG['marker_size'], color='blue', edgecolor='black', linewidth=1.0)
+    ax.scatter(pca_fake[:100, 0], pca_fake[:100, 1], alpha=0.6, label='Generated',
+               s=HIGH_RES_CONFIG['marker_size'], color='red', edgecolor='black', linewidth=1.0)
+    ax.set_xlabel('PC1', fontweight='bold', fontsize=22)
+    ax.set_ylabel('PC2', fontweight='bold', fontsize=22)
+    ax.set_title(f'PCA (Corr: {metrics["pca_correlation"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[1, 1]
+    ax.scatter(mds_real[:100, 0], mds_real[:100, 1], alpha=0.6, label='Real',
+               s=HIGH_RES_CONFIG['marker_size'], color='blue', edgecolor='black', linewidth=1.0)
+    ax.scatter(mds_fake[:100, 0], mds_fake[:100, 1], alpha=0.6, label='Generated',
+               s=HIGH_RES_CONFIG['marker_size'], color='red', edgecolor='black', linewidth=1.0)
+    ax.set_xlabel('MDS Dimension 1', fontweight='bold', fontsize=22)
+    ax.set_ylabel('MDS Dimension 2', fontweight='bold', fontsize=22)
+    ax.set_title(f'MDS (MMD: {metrics["mds_mmd"]:.4f})', fontweight='bold', fontsize=24)
+    ax.legend(fontsize=18)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
+    ax = axes[1, 2]
+    stats_text = (
+        f'Variogram MSE: {metrics["variogram_mse"]:.6f}\n'
+        f'Connectivity MSE: {metrics["connectivity_mse"]:.6f}\n'
+        f'Histogram KL: {metrics["hist_kl"]:.6f}\n'
+        f'PCA Correlation: {metrics["pca_correlation"]:.4f}\n'
+        f'MDS MMD: {metrics["mds_mmd"]:.4f}\n\n'
+        f'Real mean: {np.mean(real_flat):.4f}\n'
+        f'Fake mean: {np.mean(fake_flat):.4f}\n'
+        f'Real std: {np.std(real_flat):.4f}\n'
+        f'Fake std: {np.std(fake_flat):.4f}'
+    )
+    ax.text(0.1, 0.5, stats_text, transform=ax.transAxes,
+            fontsize=18, verticalalignment='center',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    ax.axis('off')
+    ax.set_title('Summary Statistics', fontweight='bold', fontsize=24)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    if save_path_base:
+        saved_files = save_figure_multiple_formats(fig, save_path_base, HIGH_RES_CONFIG['dpi'])
+        print(f"Static metrics plots saved: {len(saved_files)} files")
+    else:
+        plt.show()
+        saved_files = []
+    plt.close(fig)
+    return metrics, saved_files
+
+
+# ----------------------------------------------------------------------------
+# 4.8 File summary + final report generator
+# ----------------------------------------------------------------------------
+def create_file_summary(prefix="latent_diffusion"):
+    summary = {}
+    for fmt in HIGH_RES_CONFIG['save_formats']:
+        pattern = f"training_outputs/{prefix}*.{fmt}"
+        files = glob.glob(pattern)
+        summary[fmt] = len(files)
+    other_files = []
+    for pattern in [f'{prefix}*.npy', f'{prefix}*.txt', f'{prefix}*.h5', f'{prefix}*.pkl']:
+        other_files.extend(glob.glob(f"training_outputs/{pattern}"))
+    summary['other'] = len(other_files)
+    summary['total'] = sum(summary.values())
+    return summary
+
+
+def generate_final_report(filepath, params, execution_time, loss_history, metrics_history, static_metrics_results,
+                          adaptive_kl_history=None):
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("     FINAL LATENT DIFFUSION (VAE) TRAINING REPORT\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Date/Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("-" * 80 + "\n")
+        f.write("TRAINING PARAMETERS\n")
+        f.write("-" * 80 + "\n")
+        for key, value in params.items():
+            f.write(f"  {key:<35}: {value}\n")
+        f.write("\n")
+        f.write("-" * 80 + "\n")
+        f.write("EXECUTION TIME\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"  Total Time (seconds) : {execution_time:.2f}s\n")
+        f.write(f"  Total Time (minutes) : {execution_time / 60:.2f}min\n")
+        f.write(f"  Total Time (hours)   : {execution_time / 3600:.2f}h\n\n")
+        f.write("-" * 80 + "\n")
+        f.write("TRAINING METRICS (FINAL VALUES)\n")
+        f.write("-" * 80 + "\n")
+        if loss_history.total_losses:
+            last_epoch = len(loss_history.total_losses)
+            f.write(f"  Total epochs trained: {last_epoch}\n\n")
+            f.write("  Training Losses (last epoch):\n")
+            f.write(f"    Total Loss       : {loss_history.total_losses[-1]:.6f}\n")
+            f.write(f"    Diffusion Loss   : {loss_history.diffusion_losses[-1]:.6f}\n")
+            f.write(f"    Reconstruction   : {loss_history.recon_losses[-1]:.6f}\n")
+            f.write(f"    KL Loss          : {loss_history.kl_losses[-1]:.6f}\n\n")
+            f.write("  Validation Losses (last epoch):\n")
+            f.write(f"    Total Loss       : {loss_history.val_total_losses[-1]:.6f}\n")
+            f.write(f"    Diffusion Loss   : {loss_history.val_diffusion_losses[-1]:.6f}\n")
+            f.write(f"    Reconstruction   : {loss_history.val_recon_losses[-1]:.6f}\n")
+            f.write(f"    KL Loss          : {loss_history.val_kl_losses[-1]:.6f}\n\n")
+            f.write("  Best values during training:\n")
+            f.write(f"    Lowest Total Loss (train)      : {min(loss_history.total_losses):.6f} (epoch {np.argmin(loss_history.total_losses) + 1})\n")
+            f.write(f"    Lowest Total Loss (val)        : {min(loss_history.val_total_losses):.6f} (epoch {np.argmin(loss_history.val_total_losses) + 1})\n")
+            f.write(f"    Lowest Diffusion Loss (train)  : {min(loss_history.diffusion_losses):.6f} (epoch {np.argmin(loss_history.diffusion_losses) + 1})\n")
+            f.write(f"    Lowest Recon Loss (train)      : {min(loss_history.recon_losses):.6f} (epoch {np.argmin(loss_history.recon_losses) + 1})\n")
+            f.write(f"    Lowest KL Loss (train)         : {min(loss_history.kl_losses):.6f} (epoch {np.argmin(loss_history.kl_losses) + 1})\n\n")
+        f.write("-" * 80 + "\n")
+        f.write("ADAPTIVE KL WEIGHT HISTORY (first/last 10 epochs)\n")
+        f.write("-" * 80 + "\n")
+        if adaptive_kl_history and adaptive_kl_history.get('epoch'):
+            n = len(adaptive_kl_history['epoch'])
+            idx_show = list(range(min(10, n))) + ([None] if n > 20 else []) + list(range(max(10, n - 10), n))
+            for i in idx_show:
+                if i is None:
+                    f.write("  ...\n")
+                    continue
+                f.write(f"  Epoch {adaptive_kl_history['epoch'][i]:4d}: "
+                        f"kl_loss={adaptive_kl_history['kl_loss'][i]:9.4f}  "
+                        f"kl_weight={adaptive_kl_history['kl_weight'][i]:.8f}  "
+                        f"{adaptive_kl_history['action'][i]}\n")
+            f.write("\n")
+        f.write("-" * 80 + "\n")
+        f.write("TRADITIONAL METRICS (LAST EVALUATION)\n")
+        f.write("-" * 80 + "\n")
+        if hasattr(metrics_history, 'metrics'):
+            for key, values in metrics_history.metrics.items():
+                if values:
+                    f.write(f"  {key:<15}: {values[-1]:.4f}\n")
+            f.write("\n")
+        f.write("-" * 80 + "\n")
+        f.write("GEOSTATISTICAL METRICS (LAST EVALUATION)\n")
+        f.write("-" * 80 + "\n")
+        if hasattr(metrics_history, 'static_metrics'):
+            for key, values in metrics_history.static_metrics.items():
+                if values:
+                    f.write(f"  {key:<20}: {values[-1]:.6f}\n")
+            f.write("\n")
+        if static_metrics_results:
+            f.write("-" * 80 + "\n")
+            f.write("FINAL GEOSTATISTICAL METRICS (POST-TRAINING)\n")
+            f.write("-" * 80 + "\n")
+            for key, value in static_metrics_results.items():
+                if isinstance(value, (int, float)):
+                    f.write(f"  {key:<25}: {value:.6f}\n")
+            f.write("\n")
+        f.write("-" * 80 + "\n")
+        f.write("MODEL ARCHITECTURE\n")
+        f.write("-" * 80 + "\n")
+        f.write("  Encoder (VAE):\n")
+        f.write(f"    Input Shape        : ({ni}, {nj}, {nz})\n")
+        f.write(f"    Latent Dim         : {latent_dim}\n")
+        f.write("    Conv Layers        : 4 (32, 64, 128, 256 filters)\n")
+        f.write("    Dense Layer        : 256\n")
+        f.write("    Dropout            : 0.4 / 0.3\n")
+        f.write("    BatchNormalization : Yes\n")
+        f.write("    Output Heads       : z_mean, z_log_var\n\n")
+        f.write("  Decoder:\n")
+        f.write(f"    Input Dim          : {latent_dim}\n")
+        f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
+        f.write("    Output Act         : tanh\n")
+        f.write("    Dropout            : 0.2\n\n")
+        f.write("  UNet Denoiser (1D, real UNet):\n")
+        f.write(f"    Input Dim          : {latent_dim}\n")
+        f.write(f"    Time Emb Dim       : 256\n")
+        f.write("    Structure          : 3-level encoder / bottleneck / 3-level decoder\n")
+        f.write("    Skip Connections   : Yes (e2 -> U3, e1 -> U2, e0 -> U1)\n")
+        f.write("    Encoder Channels   : 64 / 128 / 256 / 512\n")
+        f.write("    Bottleneck Ch.     : 512 (x2 residual blocks)\n")
+        f.write("    Residual Blocks    : LayerNorm + Conv1D + time-conditioning\n")
+        f.write("    Activation         : swish\n\n")
+        f.write("  Diffusion:\n")
+        f.write(f"    Timesteps          : {num_timesteps}\n")
+        f.write(f"    Beta Start         : {beta_start}\n")
+        f.write(f"    Beta End           : {beta_end}\n\n")
+        f.write("  Losses:\n")
+        f.write(f"    Diffusion weight   : 1.0\n")
+        f.write(f"    Reconstruction wt. : {beta}\n")
+        f.write(f"    KL weight          : ADAPTIVE (target={ADAPTIVE_KL_TARGET}, "
+                f"tol=±{ADAPTIVE_KL_TOLERANCE*100:.0f}%, "
+                f"range=[{ADAPTIVE_KL_MIN},{ADAPTIVE_KL_MAX}], "
+                f"adj={ADAPTIVE_KL_ADJ_FACTOR}, warmup={ADAPTIVE_KL_WARMUP_EPOCHS})\n\n")
+        f.write("-" * 80 + "\n")
+        f.write("FINAL SUMMARY\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"  Training status         : {'COMPLETED' if len(loss_history.total_losses) == epochs else 'INTERRUPTED (Early Stopping)'}\n")
+        f.write(f"  Epochs executed         : {len(loss_history.total_losses)}\n")
+        f.write(f"  Total time              : {execution_time / 3600:.2f} hours\n")
+        f.write(f"  Average time per epoch  : {(execution_time / len(loss_history.total_losses)) if loss_history.total_losses else 0:.2f} seconds\n")
+        f.write(f"  Dataset                 : {name}\n")
+        f.write(f"  Training samples        : {len(x_train)}\n")
+        f.write(f"  Test samples            : {len(x_test)}\n")
+        f.write(f"  FID/FRD sampling        : {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples ({FID_N_BATCHES * FID_BATCH_SIZE} total)\n")
+        f.write(f"  Sample chunk size       : {SAMPLE_CHUNK_SIZE}\n")
+        f.write(f"  FID epsilon (reg.)      : {FID_EPS}\n\n")
+        f.write("-" * 80 + "\n")
+        f.write("GENERATED FILES\n")
+        f.write("-" * 80 + "\n")
+        saved_files_list = [
+            "training_outputs/latent_diffusion_encoder_weights.h5",
+            "training_outputs/latent_diffusion_decoder_weights.h5",
+            "training_outputs/latent_diffusion_unet_weights.h5",
+            "training_outputs/latent_diffusion_model_weights.h5",
+            "training_outputs/latent_diffusion_encoder_model.h5",
+            "training_outputs/latent_diffusion_decoder_model.h5",
+            "training_outputs/latent_diffusion_unet_model.h5",
+            "training_outputs/latent_diffusion_best_weights.h5",
+            "training_outputs/latent_diffusion_loss_history.txt",
+            "training_outputs/latent_diffusion_training_metrics.txt",
+            "training_outputs/latent_diffusion_all_metrics.csv",
+            "training_outputs/latent_diffusion_adaptive_kl_history.csv",
+            "training_outputs/latent_diffusion_distribution_data.pkl",
+            "training_outputs/latent_diffusion_execution_time.txt",
+            # ===== MINIMAL CORRECTION #2b: norm_meta appears in the report =====
+            "training_outputs/latent_diffusion_norm_meta.pkl",
+            # ===================================================================
+        ]
+        for file in saved_files_list:
+            f.write(f"  - {file}\n")
+        f.write("\n" + "=" * 80 + "\n")
+        f.write("                    END OF REPORT\n")
+        f.write("=" * 80 + "\n")
+    print(f"\n✓ Final report saved to: {filepath}")
+
+
+# ============================================================================
+# 5. TRAINING
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 5.1 Callbacks
+# ----------------------------------------------------------------------------
+class ClearMemoryCallback(Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        gc.collect()
+        K.clear_session()
+
 
 class DistributionPlotCallback(tf.keras.callbacks.Callback):
     def __init__(self, model, test_data, plot_interval=10, save_interval=10):
@@ -1547,9 +1994,9 @@ class LossHistoryCallback(tf.keras.callbacks.Callback):
         self.val_kl_losses.append(logs.get('val_kl_loss', 0))
 
 
-# ==============================================
-# ADAPTIVE KL WEIGHT CALLBACK
-# ==============================================
+# ----------------------------------------------------------------------------
+# 5.2 Adaptive KL weight callback
+# ----------------------------------------------------------------------------
 class AdaptiveKLWeightCallback(tf.keras.callbacks.Callback):
     """
     Dynamically adjusts kl_weight based on the kl_loss observed per epoch.
@@ -1624,414 +2071,9 @@ class AdaptiveKLWeightCallback(tf.keras.callbacks.Callback):
                   f"kl_weight={current_weight:.8f} -> {new_weight:.8f}  {action}")
 
 
-def plot_losses(loss_history, save_prefix="latent_diffusion", save_interval=10, total_epochs=epochs):
-    figsize = (22 * HIGH_RES_CONFIG['figsize_multiplier'],
-               14 * HIGH_RES_CONFIG['figsize_multiplier'])
-    fig = plt.figure(figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
-    plt.rcParams.update({
-        'font.size': 20, 'axes.titlesize': 24, 'axes.labelsize': 22,
-        'xtick.labelsize': 18, 'ytick.labelsize': 18, 'legend.fontsize': 18
-    })
-    epochs_range = range(1, len(loss_history.total_losses) + 1)
-    plt.subplot(2, 2, 1)
-    plt.plot(epochs_range, loss_history.total_losses, label='Training Total Loss',
-             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
-    plt.plot(epochs_range, loss_history.val_total_losses, label='Validation Total Loss',
-             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
-    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
-    plt.ylabel('Loss', fontweight='bold', fontsize=22)
-    plt.title('Total Loss', fontweight='bold', fontsize=24)
-    plt.legend(fontsize=18)
-    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
-    plt.subplot(2, 2, 2)
-    plt.plot(epochs_range, loss_history.diffusion_losses, label='Training Diffusion Loss',
-             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
-    plt.plot(epochs_range, loss_history.val_diffusion_losses, label='Validation Diffusion Loss',
-             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
-    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
-    plt.ylabel('Loss', fontweight='bold', fontsize=22)
-    plt.title('Diffusion Loss', fontweight='bold', fontsize=24)
-    plt.legend(fontsize=18)
-    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
-    plt.subplot(2, 2, 3)
-    plt.plot(epochs_range, loss_history.recon_losses, label='Training Recon Loss',
-             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
-    plt.plot(epochs_range, loss_history.val_recon_losses, label='Validation Recon Loss',
-             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
-    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
-    plt.ylabel('Loss', fontweight='bold', fontsize=22)
-    plt.title('Reconstruction Loss', fontweight='bold', fontsize=24)
-    plt.legend(fontsize=18)
-    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
-    plt.subplot(2, 2, 4)
-    plt.plot(epochs_range, loss_history.kl_losses, label='Training KL Loss',
-             linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
-    plt.plot(epochs_range, loss_history.val_kl_losses, label='Validation KL Loss',
-             linewidth=HIGH_RES_CONFIG['line_width'], color='red')
-    plt.xlabel('Epochs', fontweight='bold', fontsize=22)
-    plt.ylabel('Loss', fontweight='bold', fontsize=22)
-    plt.title('KL Loss', fontweight='bold', fontsize=24)
-    plt.legend(fontsize=18)
-    plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    plt.tick_params(axis='both', which='major', labelsize=18, width=2)
-    plt.suptitle('Latent Diffusion (VAE) Training Losses', fontsize=26, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    base_filename = f"training_outputs/{save_prefix}_all_losses"
-    saved_files = save_figure_multiple_formats(fig, base_filename, HIGH_RES_CONFIG['dpi'])
-    plt.close(fig)
-    plot_individual_losses(loss_history, save_prefix)
-    return saved_files
-
-
-def plot_individual_losses(loss_history, save_prefix="latent_diffusion"):
-    epochs_range = range(1, len(loss_history.total_losses) + 1)
-    loss_types = [
-        ('total_loss', loss_history.total_losses, loss_history.val_total_losses, 'Total Loss'),
-        ('diffusion_loss', loss_history.diffusion_losses, loss_history.val_diffusion_losses, 'Diffusion Loss'),
-        ('recon_loss', loss_history.recon_losses, loss_history.val_recon_losses, 'Reconstruction Loss'),
-        ('kl_loss', loss_history.kl_losses, loss_history.val_kl_losses, 'KL Loss')
-    ]
-    for loss_name, train_loss, val_loss, title in loss_types:
-        fig, ax = plt.subplots(figsize=(12 * HIGH_RES_CONFIG['figsize_multiplier'],
-                                        8 * HIGH_RES_CONFIG['figsize_multiplier']),
-                               dpi=HIGH_RES_CONFIG['dpi'])
-        ax.plot(epochs_range, train_loss, label='Training', linewidth=HIGH_RES_CONFIG['line_width'], color='blue')
-        ax.plot(epochs_range, val_loss, label='Validation', linewidth=HIGH_RES_CONFIG['line_width'], color='red')
-        ax.set_xlabel('Epochs', fontweight='bold', fontsize=22)
-        ax.set_ylabel('Loss', fontweight='bold', fontsize=22)
-        ax.set_title(f'Latent Diffusion (VAE): {title}', fontsize=24, fontweight='bold')
-        ax.legend(fontsize=18)
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-        ax.tick_params(axis='both', which='major', labelsize=18, width=2)
-        base_filename = f"training_outputs/{save_prefix}_{loss_name}"
-        save_figure_multiple_formats(fig, base_filename, HIGH_RES_CONFIG['dpi'])
-        plt.close(fig)
-
-
-def plot_static_metrics_comparison(real_data, diffusion_model, save_path_base=None,
-                                   sample_size=FID_SAMPLE_SIZE):
-    n_samples = min(sample_size, len(real_data))
-    fake_data = diffusion_model.sample(n_samples, training=False, verbose=False)
-    if isinstance(fake_data, tf.Tensor):
-        fake_data = fake_data.numpy()
-    if np.any(np.isnan(fake_data)):
-        fake_data = np.nan_to_num(fake_data, nan=0.0)
-    from sklearn.metrics.pairwise import rbf_kernel
-    metrics = {}
-    lags, variogram_real = StaticMetrics.variogram_2d_optimized(real_data[:100], max_lag=25)
-    _, variogram_fake = StaticMetrics.variogram_2d_optimized(fake_data[:100], max_lag=25)
-    metrics['variogram_mse'] = np.mean((variogram_real - variogram_fake) ** 2)
-    _, connectivity_real = StaticMetrics.connectivity_function(real_data[:100], 0.5, lag_distances=lags)
-    _, connectivity_fake = StaticMetrics.connectivity_function(fake_data[:100], 0.5, lag_distances=lags)
-    metrics['connectivity_mse'] = np.mean((connectivity_real - connectivity_fake) ** 2)
-    real_flat = real_data.flatten()
-    fake_flat = fake_data.flatten()
-    all_data = np.concatenate([real_flat, fake_flat])
-    data_min, data_max = np.min(all_data), np.max(all_data)
-    hist_real, bin_edges = np.histogram(real_flat, bins=100, range=(data_min, data_max), density=False)
-    hist_fake, _ = np.histogram(fake_flat, bins=100, range=(data_min, data_max), density=False)
-    hist_real = hist_real.astype(float) / np.sum(hist_real)
-    hist_fake = hist_fake.astype(float) / np.sum(hist_fake)
-    epsilon = 1e-10
-    hist_real = np.clip(hist_real, epsilon, 1)
-    hist_fake = np.clip(hist_fake, epsilon, 1)
-    metrics['hist_kl'] = np.sum(hist_real * np.log(hist_real / hist_fake))
-    pca_real, _ = StaticMetrics.calculate_pca_features(real_data[:500])
-    pca_fake, _ = StaticMetrics.calculate_pca_features(fake_data[:500])
-    if pca_real.shape[0] == pca_fake.shape[0]:
-        n_components = min(2, pca_real.shape[1], pca_fake.shape[1])
-        pca_correlations = []
-        for i in range(n_components):
-            corr = np.corrcoef(pca_real[:, i], pca_fake[:, i])[0, 1]
-            pca_correlations.append(corr)
-        metrics['pca_correlation'] = np.mean(pca_correlations)
-    else:
-        metrics['pca_correlation'] = 0.0
-    mds_real = StaticMetrics.calculate_mds_features(real_data[:500])
-    mds_fake = StaticMetrics.calculate_mds_features(fake_data[:500])
-    n_samples = min(len(mds_real), len(mds_fake), 100)
-    mds_real_small = mds_real[:n_samples]
-    mds_fake_small = mds_fake[:n_samples]
-    if len(mds_real_small) > 0 and len(mds_fake_small) > 0:
-        X = np.vstack([mds_real_small, mds_fake_small])
-        pairwise_dists = pdist(X)
-        gamma = 1.0 / (2.0 * np.median(pairwise_dists) ** 2) if len(pairwise_dists) > 0 else 1.0
-        K_XX = rbf_kernel(mds_real_small, mds_real_small, gamma=gamma)
-        K_YY = rbf_kernel(mds_fake_small, mds_fake_small, gamma=gamma)
-        K_XY = rbf_kernel(mds_real_small, mds_fake_small, gamma=gamma)
-        mmd_squared = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
-        metrics['mds_mmd'] = np.sqrt(max(mmd_squared, 0))
-    else:
-        metrics['mds_mmd'] = 0.0
-    figsize = (22 * HIGH_RES_CONFIG['figsize_multiplier'],
-               14 * HIGH_RES_CONFIG['figsize_multiplier'])
-    fig, axes = plt.subplots(2, 3, figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
-    fig.suptitle('Latent Diffusion (VAE): Static Geostatistical Metrics Comparison',
-                 fontsize=26, fontweight='bold', y=1.02)
-    for ax in axes.flat:
-        ax.tick_params(labelsize=18, width=1.5)
-        ax.xaxis.label.set_size(22)
-        ax.yaxis.label.set_size(22)
-        ax.title.set_size(24)
-    ax = axes[0, 0]
-    ax.plot(lags, variogram_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
-    ax.plot(lags, variogram_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-    ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
-    ax.set_ylabel('Variogram', fontweight='bold', fontsize=22)
-    ax.set_title(f'Variogram (MSE: {metrics["variogram_mse"]:.4f})', fontweight='bold', fontsize=24)
-    ax.legend(fontsize=18)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
-    ax = axes[0, 1]
-    ax.plot(lags, connectivity_real, 'b-', linewidth=HIGH_RES_CONFIG['line_width'], label='Real')
-    ax.plot(lags, connectivity_fake, 'r--', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-    ax.set_xlabel('Lag Distance', fontweight='bold', fontsize=22)
-    ax.set_ylabel('Connectivity', fontweight='bold', fontsize=22)
-    ax.set_title(f'Connectivity (MSE: {metrics["connectivity_mse"]:.4f})', fontweight='bold', fontsize=24)
-    ax.legend(fontsize=18)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
-    ax = axes[0, 2]
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    bar_width = bin_centers[1] - bin_centers[0]
-    ax.bar(bin_centers, hist_real, width=bar_width, alpha=0.6, label='Real', color='blue', edgecolor='black')
-    ax.plot(bin_centers, hist_fake, 'r-', linewidth=HIGH_RES_CONFIG['line_width'], label='Generated')
-    ax.set_xlabel('Value', fontweight='bold', fontsize=22)
-    ax.set_ylabel('Density', fontweight='bold', fontsize=22)
-    ax.set_title(f'Histogram (KL: {metrics["hist_kl"]:.4f})', fontweight='bold', fontsize=24)
-    ax.legend(fontsize=18)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
-    ax = axes[1, 0]
-    ax.scatter(pca_real[:100, 0], pca_real[:100, 1], alpha=0.6, label='Real',
-               s=HIGH_RES_CONFIG['marker_size'], color='blue', edgecolor='black', linewidth=1.0)
-    ax.scatter(pca_fake[:100, 0], pca_fake[:100, 1], alpha=0.6, label='Generated',
-               s=HIGH_RES_CONFIG['marker_size'], color='red', edgecolor='black', linewidth=1.0)
-    ax.set_xlabel('PC1', fontweight='bold', fontsize=22)
-    ax.set_ylabel('PC2', fontweight='bold', fontsize=22)
-    ax.set_title(f'PCA (Corr: {metrics["pca_correlation"]:.4f})', fontweight='bold', fontsize=24)
-    ax.legend(fontsize=18)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
-    ax = axes[1, 1]
-    ax.scatter(mds_real[:100, 0], mds_real[:100, 1], alpha=0.6, label='Real',
-               s=HIGH_RES_CONFIG['marker_size'], color='blue', edgecolor='black', linewidth=1.0)
-    ax.scatter(mds_fake[:100, 0], mds_fake[:100, 1], alpha=0.6, label='Generated',
-               s=HIGH_RES_CONFIG['marker_size'], color='red', edgecolor='black', linewidth=1.0)
-    ax.set_xlabel('MDS Dimension 1', fontweight='bold', fontsize=22)
-    ax.set_ylabel('MDS Dimension 2', fontweight='bold', fontsize=22)
-    ax.set_title(f'MDS (MMD: {metrics["mds_mmd"]:.4f})', fontweight='bold', fontsize=24)
-    ax.legend(fontsize=18)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-    ax.tick_params(axis='both', which='major', labelsize=18, width=2)
-    ax = axes[1, 2]
-    stats_text = (
-        f'Variogram MSE: {metrics["variogram_mse"]:.6f}\n'
-        f'Connectivity MSE: {metrics["connectivity_mse"]:.6f}\n'
-        f'Histogram KL: {metrics["hist_kl"]:.6f}\n'
-        f'PCA Correlation: {metrics["pca_correlation"]:.4f}\n'
-        f'MDS MMD: {metrics["mds_mmd"]:.4f}\n\n'
-        f'Real mean: {np.mean(real_flat):.4f}\n'
-        f'Fake mean: {np.mean(fake_flat):.4f}\n'
-        f'Real std: {np.std(real_flat):.4f}\n'
-        f'Fake std: {np.std(fake_flat):.4f}'
-    )
-    ax.text(0.1, 0.5, stats_text, transform=ax.transAxes,
-            fontsize=18, verticalalignment='center',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    ax.axis('off')
-    ax.set_title('Summary Statistics', fontweight='bold', fontsize=24)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    if save_path_base:
-        saved_files = save_figure_multiple_formats(fig, save_path_base, HIGH_RES_CONFIG['dpi'])
-        print(f"Static metrics plots saved: {len(saved_files)} files")
-    else:
-        plt.show()
-        saved_files = []
-    plt.close(fig)
-    return metrics, saved_files
-
-
-def create_file_summary(prefix="latent_diffusion"):
-    summary = {}
-    for fmt in HIGH_RES_CONFIG['save_formats']:
-        pattern = f"training_outputs/{prefix}*.{fmt}"
-        files = glob.glob(pattern)
-        summary[fmt] = len(files)
-    other_files = []
-    for pattern in [f'{prefix}*.npy', f'{prefix}*.txt', f'{prefix}*.h5', f'{prefix}*.pkl']:
-        other_files.extend(glob.glob(f"training_outputs/{pattern}"))
-    summary['other'] = len(other_files)
-    summary['total'] = sum(summary.values())
-    return summary
-
-
-def generate_final_report(filepath, params, execution_time, loss_history, metrics_history, static_metrics_results,
-                          adaptive_kl_history=None):
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write("=" * 80 + "\n")
-        f.write("     FINAL LATENT DIFFUSION (VAE) TRAINING REPORT\n")
-        f.write("=" * 80 + "\n\n")
-        f.write(f"Date/Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write("-" * 80 + "\n")
-        f.write("TRAINING PARAMETERS\n")
-        f.write("-" * 80 + "\n")
-        for key, value in params.items():
-            f.write(f"  {key:<35}: {value}\n")
-        f.write("\n")
-        f.write("-" * 80 + "\n")
-        f.write("EXECUTION TIME\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"  Total Time (seconds) : {execution_time:.2f}s\n")
-        f.write(f"  Total Time (minutes) : {execution_time / 60:.2f}min\n")
-        f.write(f"  Total Time (hours)   : {execution_time / 3600:.2f}h\n\n")
-        f.write("-" * 80 + "\n")
-        f.write("TRAINING METRICS (FINAL VALUES)\n")
-        f.write("-" * 80 + "\n")
-        if loss_history.total_losses:
-            last_epoch = len(loss_history.total_losses)
-            f.write(f"  Total epochs trained: {last_epoch}\n\n")
-            f.write("  Training Losses (last epoch):\n")
-            f.write(f"    Total Loss       : {loss_history.total_losses[-1]:.6f}\n")
-            f.write(f"    Diffusion Loss   : {loss_history.diffusion_losses[-1]:.6f}\n")
-            f.write(f"    Reconstruction   : {loss_history.recon_losses[-1]:.6f}\n")
-            f.write(f"    KL Loss          : {loss_history.kl_losses[-1]:.6f}\n\n")
-            f.write("  Validation Losses (last epoch):\n")
-            f.write(f"    Total Loss       : {loss_history.val_total_losses[-1]:.6f}\n")
-            f.write(f"    Diffusion Loss   : {loss_history.val_diffusion_losses[-1]:.6f}\n")
-            f.write(f"    Reconstruction   : {loss_history.val_recon_losses[-1]:.6f}\n")
-            f.write(f"    KL Loss          : {loss_history.val_kl_losses[-1]:.6f}\n\n")
-            f.write("  Best values during training:\n")
-            f.write(f"    Lowest Total Loss (train)      : {min(loss_history.total_losses):.6f} (epoch {np.argmin(loss_history.total_losses) + 1})\n")
-            f.write(f"    Lowest Total Loss (val)        : {min(loss_history.val_total_losses):.6f} (epoch {np.argmin(loss_history.val_total_losses) + 1})\n")
-            f.write(f"    Lowest Diffusion Loss (train)  : {min(loss_history.diffusion_losses):.6f} (epoch {np.argmin(loss_history.diffusion_losses) + 1})\n")
-            f.write(f"    Lowest Recon Loss (train)      : {min(loss_history.recon_losses):.6f} (epoch {np.argmin(loss_history.recon_losses) + 1})\n")
-            f.write(f"    Lowest KL Loss (train)         : {min(loss_history.kl_losses):.6f} (epoch {np.argmin(loss_history.kl_losses) + 1})\n\n")
-        f.write("-" * 80 + "\n")
-        f.write("ADAPTIVE KL WEIGHT HISTORY (first/last 10 epochs)\n")
-        f.write("-" * 80 + "\n")
-        if adaptive_kl_history and adaptive_kl_history.get('epoch'):
-            n = len(adaptive_kl_history['epoch'])
-            idx_show = list(range(min(10, n))) + ([None] if n > 20 else []) + list(range(max(10, n - 10), n))
-            for i in idx_show:
-                if i is None:
-                    f.write("  ...\n")
-                    continue
-                f.write(f"  Epoch {adaptive_kl_history['epoch'][i]:4d}: "
-                        f"kl_loss={adaptive_kl_history['kl_loss'][i]:9.4f}  "
-                        f"kl_weight={adaptive_kl_history['kl_weight'][i]:.8f}  "
-                        f"{adaptive_kl_history['action'][i]}\n")
-            f.write("\n")
-        f.write("-" * 80 + "\n")
-        f.write("TRADITIONAL METRICS (LAST EVALUATION)\n")
-        f.write("-" * 80 + "\n")
-        if hasattr(metrics_history, 'metrics'):
-            for key, values in metrics_history.metrics.items():
-                if values:
-                    f.write(f"  {key:<15}: {values[-1]:.4f}\n")
-            f.write("\n")
-        f.write("-" * 80 + "\n")
-        f.write("GEOSTATISTICAL METRICS (LAST EVALUATION)\n")
-        f.write("-" * 80 + "\n")
-        if hasattr(metrics_history, 'static_metrics'):
-            for key, values in metrics_history.static_metrics.items():
-                if values:
-                    f.write(f"  {key:<20}: {values[-1]:.6f}\n")
-            f.write("\n")
-        if static_metrics_results:
-            f.write("-" * 80 + "\n")
-            f.write("FINAL GEOSTATISTICAL METRICS (POST-TRAINING)\n")
-            f.write("-" * 80 + "\n")
-            for key, value in static_metrics_results.items():
-                if isinstance(value, (int, float)):
-                    f.write(f"  {key:<25}: {value:.6f}\n")
-            f.write("\n")
-        f.write("-" * 80 + "\n")
-        f.write("MODEL ARCHITECTURE\n")
-        f.write("-" * 80 + "\n")
-        f.write("  Encoder (VAE):\n")
-        f.write(f"    Input Shape        : ({ni}, {nj}, {nz})\n")
-        f.write(f"    Latent Dim         : {latent_dim}\n")
-        f.write("    Conv Layers        : 4 (32, 64, 128, 256 filters)\n")
-        f.write("    Dense Layer        : 256\n")
-        f.write("    Dropout            : 0.4 / 0.3\n")
-        f.write("    BatchNormalization : Yes\n")
-        f.write("    Output Heads       : z_mean, z_log_var\n\n")
-        f.write("  Decoder:\n")
-        f.write(f"    Input Dim          : {latent_dim}\n")
-        f.write("    ConvTranspose      : 3 (128, 64, 32 filters)\n")
-        f.write("    Output Act         : tanh\n")
-        f.write("    Dropout            : 0.2\n\n")
-        f.write("  UNet Denoiser (1D, real UNet):\n")
-        f.write(f"    Input Dim          : {latent_dim}\n")
-        f.write(f"    Time Emb Dim       : 256\n")
-        f.write("    Structure          : 3-level encoder / bottleneck / 3-level decoder\n")
-        f.write("    Skip Connections   : Yes (e2 -> U3, e1 -> U2, e0 -> U1)\n")
-        f.write("    Encoder Channels   : 64 / 128 / 256 / 512\n")
-        f.write("    Bottleneck Ch.     : 512 (x2 residual blocks)\n")
-        f.write("    Residual Blocks    : LayerNorm + Conv1D + time-conditioning\n")
-        f.write("    Activation         : swish\n\n")
-        f.write("  Diffusion:\n")
-        f.write(f"    Timesteps          : {num_timesteps}\n")
-        f.write(f"    Beta Start         : {beta_start}\n")
-        f.write(f"    Beta End           : {beta_end}\n\n")
-        f.write("  Losses:\n")
-        f.write(f"    Diffusion weight   : 1.0\n")
-        f.write(f"    Reconstruction wt. : {beta}\n")
-        f.write(f"    KL weight          : ADAPTIVE (target={ADAPTIVE_KL_TARGET}, "
-                f"tol=±{ADAPTIVE_KL_TOLERANCE*100:.0f}%, "
-                f"range=[{ADAPTIVE_KL_MIN},{ADAPTIVE_KL_MAX}], "
-                f"adj={ADAPTIVE_KL_ADJ_FACTOR}, warmup={ADAPTIVE_KL_WARMUP_EPOCHS})\n\n")
-        f.write("-" * 80 + "\n")
-        f.write("FINAL SUMMARY\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"  Training status         : {'COMPLETED' if len(loss_history.total_losses) == epochs else 'INTERRUPTED (Early Stopping)'}\n")
-        f.write(f"  Epochs executed         : {len(loss_history.total_losses)}\n")
-        f.write(f"  Total time              : {execution_time / 3600:.2f} hours\n")
-        f.write(f"  Average time per epoch  : {(execution_time / len(loss_history.total_losses)) if loss_history.total_losses else 0:.2f} seconds\n")
-        f.write(f"  Dataset                 : {name}\n")
-        f.write(f"  Training samples        : {len(x_train)}\n")
-        f.write(f"  Test samples            : {len(x_test)}\n")
-        f.write(f"  FID/FRD sampling        : {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples ({FID_N_BATCHES * FID_BATCH_SIZE} total)\n")
-        f.write(f"  Sample chunk size       : {SAMPLE_CHUNK_SIZE}\n")
-        f.write(f"  FID epsilon (reg.)      : {FID_EPS}\n\n")
-        f.write("-" * 80 + "\n")
-        f.write("GENERATED FILES\n")
-        f.write("-" * 80 + "\n")
-        saved_files_list = [
-            "training_outputs/latent_diffusion_encoder_weights.h5",
-            "training_outputs/latent_diffusion_decoder_weights.h5",
-            "training_outputs/latent_diffusion_unet_weights.h5",
-            "training_outputs/latent_diffusion_model_weights.h5",
-            "training_outputs/latent_diffusion_encoder_model.h5",
-            "training_outputs/latent_diffusion_decoder_model.h5",
-            "training_outputs/latent_diffusion_unet_model.h5",
-            "training_outputs/latent_diffusion_best_weights.h5",
-            "training_outputs/latent_diffusion_loss_history.txt",
-            "training_outputs/latent_diffusion_training_metrics.txt",
-            "training_outputs/latent_diffusion_all_metrics.csv",
-            "training_outputs/latent_diffusion_adaptive_kl_history.csv",
-            "training_outputs/latent_diffusion_distribution_data.pkl",
-            "training_outputs/latent_diffusion_execution_time.txt",
-            # ===== MINIMAL CORRECTION #2b: norm_meta appears in the report =====
-            "training_outputs/latent_diffusion_norm_meta.pkl",
-            # ===================================================================
-        ]
-        for file in saved_files_list:
-            f.write(f"  - {file}\n")
-        f.write("\n" + "=" * 80 + "\n")
-        f.write("                    END OF REPORT\n")
-        f.write("=" * 80 + "\n")
-    print(f"\n✓ Final report saved to: {filepath}")
-
-
-# ==============================================
-# TRAINING
-# ==============================================
-
+# ----------------------------------------------------------------------------
+# 5.3 Training setup and execution
+# ----------------------------------------------------------------------------
 os.makedirs('training_outputs', exist_ok=True)
 
 train_dataset = tf.data.Dataset.from_tensor_slices((x_train.astype('float32'), x_train.astype('float32'))).shuffle(
@@ -2071,50 +2113,30 @@ model_checkpoint = keras.callbacks.ModelCheckpoint(
 )
 
 early_stopping = keras.callbacks.EarlyStopping(
-    monitor='val_loss',
-    patience=100,
-    restore_best_weights=True,
-    min_delta=1e-4
-)
-
-tensorboard = keras.callbacks.TensorBoard(
-    log_dir='training_outputs/latent_diffusion_logs', update_freq='epoch'
+    monitor='val_loss', patience=100, restore_best_weights=True
 )
 
 reduce_lr = keras.callbacks.ReduceLROnPlateau(
-    monitor='val_loss',
-    factor=0.7,
-    patience=50,
-    min_lr=1e-7,
-    verbose=1
+    monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=1
 )
 
-start_time = time.time()
-
 print("\n" + "=" * 60)
-print("STARTING LATENT DIFFUSION (VAE) TRAINING — CONTINUOUS CASE")
+print("STARTING LATENT DIFFUSION (VAE) TRAINING - CONTINUOUS")
 print("=" * 60)
 print(f"Dataset: {name} (CONTINUOUS)")
-print(f"Encoder: VAE (z_mean + z_log_var, reparameterization)")
-print(f"Denoiser: REAL 1D UNET")
-print(f"Decoder: continuous (tanh)")
-print(f"Latent dimension: {latent_dim}")
-print(f"Batch size: {batch_size}")
-print(f"Epochs: {epochs}")
-print(f"Learning rate: {initial_lr}")
-print(f"Number of diffusion timesteps: {num_timesteps}")
-print(f"Beta schedule: {beta_start} to {beta_end}")
-print(f"Reconstruction weight (beta): {beta}")
-print(f"KL weight: ADAPTIVE (initial={kl_weight}, target={ADAPTIVE_KL_TARGET})")
-print(f"Save interval: {SAVE_INTERVAL} epochs")
-print(f"Metrics calculation interval: {SAVE_INTERVAL} epochs")
-print(f"FID/FRD sampling: {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples ({FID_N_BATCHES * FID_BATCH_SIZE} total)")
+print(f"Encoder: VAE (dual head: z_mean, z_log_var)")
+print(f"Decoder: continuous (tanh output, target in [-1,1])")
+print(f"UNet: REAL 1D UNET (3 down / 3 up with skip connections)")
+print(f"Diffusion steps: {num_timesteps}")
+print(f"KL weight: ADAPTIVE (target={ADAPTIVE_KL_TARGET}, "
+      f"range=[{ADAPTIVE_KL_MIN},{ADAPTIVE_KL_MAX}])")
+print(f"FID/FRD sampling: {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples "
+      f"({FID_N_BATCHES * FID_BATCH_SIZE} total)")
 print(f"Sample chunk size: {SAMPLE_CHUNK_SIZE}")
-print(f"FID epsilon (regularization): {FID_EPS}")
-print(f"GPU allocator: {os.environ.get('TF_GPU_ALLOCATOR', 'default')}")
-print(f"Training samples: {len(x_train)}")
-print(f"Test samples: {len(x_test)}")
-print("=" * 60)
+print(f"FID epsilon: {FID_EPS}")
+print("=" * 60 + "\n")
+
+start_time = time.time()
 
 history = diffusion_model.fit(
     train_dataset,
@@ -2128,76 +2150,93 @@ history = diffusion_model.fit(
         adaptive_kl_callback,
         model_checkpoint,
         early_stopping,
-        tensorboard,
-        reduce_lr
+        reduce_lr,
     ],
     verbose=1
 )
 
 plt.ioff()
+plt.close('all')
 
 end_time = time.time()
 execution_time = end_time - start_time
 
-print(f"\n[INFO] Latent Diffusion (VAE) training completed in {execution_time / 3600:.2f} hours")
+print(f"\n[INFO] Training completed in {execution_time / 3600:.2f} hours")
 
 
-def save_execution_time(filename, execution_time, adaptive_kl_history=None):
+# ============================================================================
+# 6. EVALUATION & PLOTS
+# ============================================================================
+
+print("\n" + "=" * 60)
+print("FINAL ANALYSIS AND PLOTS")
+print("=" * 60)
+
+# Final distribution plot
+test_samples = x_test[:5]
+z_mean_test, _ = diffusion_model.encoder.predict(test_samples, verbose=0)
+reconstructions = diffusion_model.decoder.predict(z_mean_test, verbose=0)
+latent_samples = analyze_latent_space(diffusion_model.encoder, x_test, num_samples=1000)
+
+print("Saving final distribution plots...")
+saved_dist_files = plot_histograms_and_densities(test_samples, reconstructions, latent_samples)
+print(f"Saved final distribution plots: {len(saved_dist_files)} files")
+
+# Latent space visualization
+figsize = (14 * HIGH_RES_CONFIG['figsize_multiplier'],
+           7 * HIGH_RES_CONFIG['figsize_multiplier'])
+fig = plt.figure(figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
+z_samples, _ = diffusion_model.encoder.predict(x_test[:1000], verbose=0)
+pca = PCA(n_components=2)
+z_2d = pca.fit_transform(z_samples)
+plt.scatter(z_2d[:, 0], z_2d[:, 1], alpha=0.5, s=HIGH_RES_CONFIG['marker_size'])
+plt.title('2D Projection of Latent Space (PCA)', fontsize=24, fontweight='bold')
+plt.xlabel('PCA Component 1', fontweight='bold', fontsize=22)
+plt.ylabel('PCA Component 2', fontweight='bold', fontsize=22)
+plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
+save_figure_multiple_formats(fig, "training_outputs/latent_diffusion_latent_space_2d", HIGH_RES_CONFIG['dpi'])
+plt.close(fig)
+
+# Static metrics comparison
+static_metrics_results, saved_static_files = plot_static_metrics_comparison(
+    x_test, diffusion_model,
+    save_path_base='training_outputs/latent_diffusion_static_metrics_comparison',
+    sample_size=FID_SAMPLE_SIZE,
+)
+
+# Loss plots
+print("Saving loss plots...")
+saved_loss_files = plot_losses(loss_history_callback, save_prefix="latent_diffusion")
+
+
+# ============================================================================
+# 7. SAVING
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 7.1 Execution time and loss history files
+# ----------------------------------------------------------------------------
+def save_execution_time(filename, execution_time):
     with open(filename, 'w') as f:
-        f.write(f"=== Latent Diffusion (VAE) Execution Time ===\n")
+        f.write(f"=== Execution Time ===\n")
         f.write(f"Total: {execution_time:.2f} seconds\n")
         f.write(f"Total: {execution_time / 60:.2f} minutes\n")
         f.write(f"Total: {execution_time / 3600:.2f} hours\n")
-        f.write(f"\nSettings:\n")
-        f.write(f"- Dataset: {name} (CONTINUOUS)\n")
-        f.write(f"- Encoder: VAE (dual head)\n")
-        f.write(f"- Batch size: {batch_size}\n")
-        f.write(f"- Epochs: {epochs}\n")
-        f.write(f"- Latent dim: {latent_dim}\n")
-        f.write(f"- Learning rate: {initial_lr}\n")
-        f.write(f"- Diffusion timesteps: {num_timesteps}\n")
-        f.write(f"- KL weight: ADAPTIVE\n")
-        f.write(f"    initial  : {kl_weight}\n")
-        f.write(f"    target   : {ADAPTIVE_KL_TARGET} (band [{ADAPTIVE_KL_TARGET*(1-ADAPTIVE_KL_TOLERANCE):.2f}, "
-                f"{ADAPTIVE_KL_TARGET*(1+ADAPTIVE_KL_TOLERANCE):.2f}])\n")
-        f.write(f"    range    : [{ADAPTIVE_KL_MIN}, {ADAPTIVE_KL_MAX}]\n")
-        f.write(f"    adj_fac  : {ADAPTIVE_KL_ADJ_FACTOR} (per epoch)\n")
-        f.write(f"    warmup   : {ADAPTIVE_KL_WARMUP_EPOCHS} epochs\n")
-        if adaptive_kl_history and adaptive_kl_history.get('kl_weight'):
-            f.write(f"    final    : {adaptive_kl_history['kl_weight'][-1]:.8f}\n")
-        f.write(f"- Save interval: {SAVE_INTERVAL} epochs\n")
-        f.write(f"- Metrics interval: {SAVE_INTERVAL} epochs\n")
-        f.write(f"- FID/FRD sampling: {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples ({FID_N_BATCHES * FID_BATCH_SIZE} total)\n")
-        f.write(f"- Sample chunk size: {SAMPLE_CHUNK_SIZE}\n")
-        f.write(f"- FID epsilon: {FID_EPS}\n")
-        f.write(f"- GPU allocator: {os.environ.get('TF_GPU_ALLOCATOR', 'default')}\n")
-        # ===== MINIMAL CORRECTION #1c: log min/max in execution_time =====
-        if X_train_min_val is not None:
-            f.write(f"\nNormalization metadata (MINIMAL CORRECTION):\n")
-            f.write(f"- X_train min (log-space) : {X_train_min_val:.6f}\n")
-            f.write(f"- X_train max (log-space) : {X_train_max_val:.6f}\n")
-            f.write(f"- formula                 : y = 2*(log(x)-min)/(max-min) - 1\n")
-            f.write(f"- saved to                : training_outputs/latent_diffusion_norm_meta.pkl\n")
-        # =================================================================
+        f.write(f"\nSettings:\n- Dataset: {name}\n- Batch size: {batch_size}\n"
+                f"- Epochs: {epochs}\n- Latent dim: {latent_dim}\n- Learning rate: {initial_lr}\n"
+                f"- Beta (reconstruction weight): {beta}\n"
+                f"- KL weight: ADAPTIVE (target={ADAPTIVE_KL_TARGET})\n"
+                f"- Diffusion timesteps: {num_timesteps}\n"
+                f"- Beta start / end: {beta_start} / {beta_end}\n"
+                f"- FID/FRD sampling: {FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples "
+                f"({FID_N_BATCHES * FID_BATCH_SIZE} total)\n")
 
 
-save_execution_time("training_outputs/latent_diffusion_execution_time.txt", execution_time,
-                    adaptive_kl_history=adaptive_kl_callback.history)
+save_execution_time("training_outputs/latent_diffusion_execution_time.txt", execution_time)
+print(f"\n[INFO] Execution time saved to training_outputs/latent_diffusion_execution_time.txt")
 
-# Save adaptive kl_weight history
-if adaptive_kl_callback.history['epoch']:
-    adaptive_df = pd.DataFrame({
-        'Epoch': adaptive_kl_callback.history['epoch'],
-        'KL_Loss': adaptive_kl_callback.history['kl_loss'],
-        'KL_Weight': adaptive_kl_callback.history['kl_weight'],
-        'Action': adaptive_kl_callback.history['action'],
-    })
-    adaptive_df.to_csv('training_outputs/latent_diffusion_adaptive_kl_history.csv', index=False)
-    print(f"Adaptive KL history saved to training_outputs/latent_diffusion_adaptive_kl_history.csv")
 
-saved_loss_files = plot_losses(loss_history_callback, save_prefix="latent_diffusion")
-print(f"Saved final loss plots: {len(saved_loss_files)} files")
-
+# Save loss history to text file
 with open('training_outputs/latent_diffusion_loss_history.txt', 'w') as f:
     f.write("Epoch\tTotal_Loss\tDiffusion_Loss\tRecon_Loss\tKL_Loss\t"
             "Val_Total_Loss\tVal_Diffusion_Loss\tVal_Recon_Loss\tVal_KL_Loss\n")
@@ -2211,126 +2250,64 @@ with open('training_outputs/latent_diffusion_loss_history.txt', 'w') as f:
                 f"{loss_history_callback.val_diffusion_losses[i]:.6f}\t"
                 f"{loss_history_callback.val_recon_losses[i]:.6f}\t"
                 f"{loss_history_callback.val_kl_losses[i]:.6f}\n")
+print("Loss history saved to training_outputs/latent_diffusion_loss_history.txt")
 
+
+# Save adaptive KL history to CSV
+if adaptive_kl_callback.history['epoch']:
+    adaptive_df = pd.DataFrame({
+        'Epoch': adaptive_kl_callback.history['epoch'],
+        'KL_Loss': adaptive_kl_callback.history['kl_loss'],
+        'KL_Weight': adaptive_kl_callback.history['kl_weight'],
+        'Action': adaptive_kl_callback.history['action'],
+    })
+    adaptive_df.to_csv('training_outputs/latent_diffusion_adaptive_kl_history.csv', index=False)
+    print(f"Adaptive KL history saved to training_outputs/latent_diffusion_adaptive_kl_history.csv")
+
+
+# Save distribution data
+dist_data = {
+    'original': test_samples.flatten(),
+    'reconstructed': reconstructions.flatten(),
+    'latent': latent_samples
+}
+with open('training_outputs/latent_diffusion_distribution_data.pkl', 'wb') as f:
+    pickle.dump(dist_data, f)
+print("Distribution data saved to training_outputs/latent_diffusion_distribution_data.pkl")
+
+
+# ----------------------------------------------------------------------------
+# 7.2 Model weights
+# ----------------------------------------------------------------------------
+print("Saving model weights...")
 encoder.save_weights('training_outputs/latent_diffusion_encoder_weights.h5')
 decoder.save_weights('training_outputs/latent_diffusion_decoder_weights.h5')
 unet.save_weights('training_outputs/latent_diffusion_unet_weights.h5')
 diffusion_model.save_weights('training_outputs/latent_diffusion_model_weights.h5')
+print("Weights saved.")
 
+# ----------------------------------------------------------------------------
+# 7.3 Full models
+# ----------------------------------------------------------------------------
+print("Saving models...")
 encoder.save('training_outputs/latent_diffusion_encoder_model.h5')
 decoder.save('training_outputs/latent_diffusion_decoder_model.h5')
 unet.save('training_outputs/latent_diffusion_unet_model.h5')
-tf.saved_model.save(diffusion_model, 'training_outputs/latent_diffusion_final_model')
+print("Full models saved.")
 
-print("\n" + "=" * 60)
-print("FINAL ANALYSIS AND SAVING")
-print("=" * 60)
-
-test_samples = x_test[:5]
-z_mean_test, _ = diffusion_model.encoder.predict(test_samples, verbose=0)
-reconstructions = diffusion_model.decoder.predict(z_mean_test, verbose=0)
-latent_samples = analyze_latent_space(diffusion_model.encoder, x_test, num_samples=1000)
-
-# ===== MINIMAL CORRECTION #2c: continuous decoder sanity check =====
-# Confirms that decoder(encoder_mean(x)) ≈ x in the normalized space. If it fails,
-# the assimilation RMSE will be high for the wrong reason — and we now have an
-# explicit signal of that.
-print("\n" + "=" * 60)
-print("SANITY CHECK (MINIMAL CORRECTION): decoder(encoder_mean(x)) ≈ x")
-print("=" * 60)
-sanity_mae, sanity_rmse, sanity_corr = sanity_check_decoder(
-    encoder=diffusion_model.encoder,
-    decoder=diffusion_model.decoder,
-    data=x_test,
-    n=20,
-)
-# =====================================================================
-
-print("Saving final distribution plots...")
-saved_dist_files = plot_histograms_and_densities(test_samples, reconstructions, latent_samples)
-print(f"Saved final distribution plots: {len(saved_dist_files)} files")
-
-print("Saving latent space visualization...")
-figsize = (14 * HIGH_RES_CONFIG['figsize_multiplier'],
-           8 * HIGH_RES_CONFIG['figsize_multiplier'])
-fig = plt.figure(figsize=figsize, dpi=HIGH_RES_CONFIG['dpi'])
-plt.rcParams.update({
-    'font.size': 20, 'axes.titlesize': 24, 'axes.labelsize': 22,
-    'xtick.labelsize': 18, 'ytick.labelsize': 18
-})
-z_mean_proj, _ = diffusion_model.encoder.predict(x_test[:1000], verbose=0)
-pca = PCA(n_components=2)
-latent_2d = pca.fit_transform(z_mean_proj)
-plt.scatter(latent_2d[:, 0], latent_2d[:, 1], alpha=0.5, s=HIGH_RES_CONFIG['marker_size'])
-plt.title('Latent Diffusion (VAE): 2D Projection of Latent Space (PCA)',
-          fontsize=24, fontweight='bold')
-plt.xlabel('PCA Component 1', fontweight='bold', fontsize=22)
-plt.ylabel('PCA Component 2', fontweight='bold', fontsize=22)
-plt.grid(True, alpha=0.3, linestyle='--', linewidth=1.5)
-plt.tick_params(axis='both', which='major', labelsize=18, width=2)
-base_filename = "training_outputs/latent_diffusion_latent_space_2d"
-saved_latent_files = save_figure_multiple_formats(fig, base_filename, HIGH_RES_CONFIG['dpi'])
-print(f"Saved final latent space plots: {len(saved_latent_files)} files")
-plt.close(fig)
-
-print("Saving final static metrics comparison...")
-static_metrics_results, saved_static_files = plot_static_metrics_comparison(
-    x_test, diffusion_model,
-    save_path_base='training_outputs/latent_diffusion_static_metrics_comparison',
-    sample_size=FID_SAMPLE_SIZE
-)
-print(f"Saved final static metrics plots: {len(saved_static_files)} files")
-
-print("Saving distribution data...")
-dist_data = {
-    'original': test_samples.flatten(),
-    'reconstructed': reconstructions.flatten(),
-    'latent': latent_samples.flatten() if isinstance(latent_samples, np.ndarray) else latent_samples,
-    'latent_2d_projection': latent_2d
-}
-with open('training_outputs/latent_diffusion_distribution_data.pkl', 'wb') as f:
-    pickle.dump(dist_data, f)
-print("Saved distribution data to pickle file")
-
-file_summary = create_file_summary("latent_diffusion")
-print("\n" + "=" * 60)
-print("LATENT DIFFUSION (VAE) FILE SAVING SUMMARY")
-print("=" * 60)
-print(f"PNG files saved: {file_summary['png']}")
-print(f"SVG files saved: {file_summary['svg']}")
-print(f"Other files (npy, txt, h5, pkl): {file_summary['other']}")
-print(f"TOTAL files saved: {file_summary['total']}")
-print("=" * 60)
-
-print("Saving final reconstructions comparison...")
-fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-for i in range(5):
-    axes[0, i].imshow(test_samples[i].squeeze(), cmap='viridis')
-    axes[0, i].set_title(f'Original {i + 1}', fontsize=20, fontweight='bold')
-    axes[0, i].axis('off')
-    axes[1, i].imshow(reconstructions[i].squeeze(), cmap='viridis')
-    axes[1, i].set_title(f'Reconstructed {i + 1}', fontsize=20, fontweight='bold')
-    axes[1, i].axis('off')
-plt.suptitle('Latent Diffusion (VAE): Final Reconstruction Comparison',
-             fontsize=26, fontweight='bold')
-plt.tight_layout()
-saved_final_files = save_figure_multiple_formats(fig, "training_outputs/latent_diffusion_final_reconstructions",
-                                                 HIGH_RES_CONFIG['dpi'])
-print(f"Saved final reconstruction comparison: {len(saved_final_files)} files")
-plt.show()
-
-# ==============================================
-# GENERATE AND SAVE FINAL REPORT
-# ==============================================
-
+# ----------------------------------------------------------------------------
+# 7.4 Final report
+# ----------------------------------------------------------------------------
 training_params = {
-    'Dataset': f'{name} (CONTINUOUS)',
-    'Encoder type': 'VAE (z_mean + z_log_var + reparameterization)',
+    'Dataset': name,
+    'Type': 'CONTINUOUS (log_then_minmax)',
     'Latent dimension (zdim)': zdim,
     'Configured epochs': epochs,
     'Batch size': batch_size,
     'Initial learning rate': initial_lr,
     'Beta (reconstruction weight)': beta,
+    'Gamma (perceptual weight)': gamma,
+    'Alpha (LeakyReLU)': alpha,
     'KL weight (mode)': 'ADAPTIVE',
     'KL weight (initial)': kl_weight,
     'KL target': ADAPTIVE_KL_TARGET,
@@ -2338,36 +2315,29 @@ training_params = {
     'KL weight (min/max)': f'[{ADAPTIVE_KL_MIN}, {ADAPTIVE_KL_MAX}]',
     'KL adjustment factor': ADAPTIVE_KL_ADJ_FACTOR,
     'KL warmup epochs': ADAPTIVE_KL_WARMUP_EPOCHS,
-    'Gamma (perceptual weight)': gamma,
-    'Alpha (LeakyReLU)': alpha,
     'Image dimensions (ni x nj x nz)': f'{ni} x {nj} x {nz}',
     'Diffusion timesteps': num_timesteps,
     'Beta start': beta_start,
     'Beta end': beta_end,
     'Training samples': len(x_train),
     'Test samples': len(x_test),
-    'Model': 'Latent Diffusion Model with VAE encoder + real 1D UNet denoiser',
+    'Model': 'Latent Diffusion with VAE encoder + 1D UNet denoiser + continuous decoder',
     'UNet structure': 'Encoder(3) + Bottleneck(2x) + Decoder(3) with skip connections',
     'UNet base filters': 64,
     'UNet time emb dim': 256,
     'Optimizer': 'Adam (beta1=0.5, clipnorm=1.0)',
-    'Early Stopping': 'Yes (patience=200, min_delta=1e-5, monitor=val_loss)',
-    'LR Scheduler': 'ReduceLROnPlateau (factor=0.7, patience=50, min_lr=1e-7)',
+    'Early Stopping': 'Yes (patience=100, monitor=val_loss)',
+    'LR Scheduler': 'ReduceLROnPlateau (factor=0.5, patience=5)',
     'Metric interval': metric_interval,
-    'Save interval': SAVE_INTERVAL,
-    'FID/FRD sampling': f'{FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples ({FID_N_BATCHES * FID_BATCH_SIZE} total)',
+    'FID/FRD sampling': f'{FID_N_BATCHES} batches x {FID_BATCH_SIZE} samples '
+                        f'({FID_N_BATCHES * FID_BATCH_SIZE} total)',
     'Sample chunk size': SAMPLE_CHUNK_SIZE,
     'FID epsilon': FID_EPS,
-    'GPU allocator': os.environ.get('TF_GPU_ALLOCATOR', 'default'),
-    # ===== MINIMAL CORRECTION #1d / #2d: normalization params and sanity check in the report =====
-    'X_train min (log-space, pre-normalization)': f'{X_train_min_val:.6f}' if X_train_min_val is not None else 'N/A',
-    'X_train max (log-space, pre-normalization)': f'{X_train_max_val:.6f}' if X_train_max_val is not None else 'N/A',
-    'Normalization formula': 'y = 2*(log(x)-min)/(max-min) - 1',
-    'Norm meta file': 'training_outputs/latent_diffusion_norm_meta.pkl',
-    'Sanity check MAE (decoder∘encoder_mean)': f'{sanity_mae:.6e}',
-    'Sanity check RMSE (decoder∘encoder_mean)': f'{sanity_rmse:.6e}',
-    'Sanity check corr (decoder∘encoder_mean)': f'{sanity_corr:.4f}',
-    # ============================================================================================
+    'InceptionV3 input_shape': str(f_extraction_iv3.input_shape),
+    'ReservoirClassifier input_shape': str(f_extraction_rc.input_shape),
+    'FID/FRD technique': f'{FID_N_BATCHES} batches x {FID_BATCH_SIZE} '
+                         f'(accumulated mean/cov) + scipy sqrtm (stable)',
+    'KID/KRD technique': 'MMD^2 with cubic polynomial kernel (n<=500)',
 }
 
 report_path = os.path.join('training_outputs', 'latent_diffusion_final_report.txt')
@@ -2381,24 +2351,17 @@ generate_final_report(
     adaptive_kl_history=adaptive_kl_callback.history,
 )
 
+# ----------------------------------------------------------------------------
+# 7.5 Final summary
+# ----------------------------------------------------------------------------
 print("\n" + "=" * 60)
-print("LATENT DIFFUSION (VAE) TRAINING COMPLETED SUCCESSFULLY — CONTINUOUS CASE")
+print("TRAINING COMPLETED SUCCESSFULLY")
 print("=" * 60)
-print(f"Training Summary:")
-print(f"- Dataset: {name} (CONTINUOUS)")
-print(f"- Encoder: VAE (dual head)")
-print(f"- Total epochs: {epochs}")
-print(f"- Save interval: {SAVE_INTERVAL} epochs")
-print(f"- Metrics calculation interval: {SAVE_INTERVAL} epochs")
-print(f"- KL weight: ADAPTIVE (initial={kl_weight}, target={ADAPTIVE_KL_TARGET})")
-if adaptive_kl_callback.history['kl_weight']:
-    print(f"- KL weight final: {adaptive_kl_callback.history['kl_weight'][-1]:.8f}")
-print(f"- Execution time: {execution_time / 3600:.2f} hours")
-print(f"- Total files saved: {file_summary['total']}")
-if X_train_min_val is not None:
-    print(f"- X_train min/max (log-space): {X_train_min_val:.6f} / {X_train_max_val:.6f}")
-    print(f"- Norm meta saved to: training_outputs/latent_diffusion_norm_meta.pkl")
-print(f"- Sanity check (decoder∘encoder): MAE={sanity_mae:.4e}, corr={sanity_corr:.4f}")
+print(f"Execution time: {execution_time / 3600:.2f} hours")
+if len(loss_history_callback.total_losses) > 0:
+    print(f"Total epochs trained: {len(loss_history_callback.total_losses)}")
+    print(f"Final Training Total Loss: {loss_history_callback.total_losses[-1]:.4f}")
+    print(f"Final Validation Total Loss: {loss_history_callback.val_total_losses[-1]:.4f}")
 print("=" * 60)
 print(f"\nFinal complete report saved to: {report_path}")
 print("=" * 60)
